@@ -1,0 +1,38 @@
+name: hommie
+description: A social real estate app.
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: ">=2.18.0 <4.0.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  firebase_core: ^4.0.0
+  firebase_auth: ^6.0.0
+  cloud_firestore: ^6.0.0
+  image_picker: ^1.0.4
+  firebase_storage: ^13.0.0
+  flutter_launcher_icons: ^0.14.4
+  geolocator: ^14.0.2
+  geocoding: ^3.0.0
+  lottie: ^2.7.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/welcome_background.png
+    - assets/avatars/
+    - assets/images/home_screen.png
+    - assets/images/welcome_background.jpg
+    - assets/animations/clouds.json
+
+flutter_launcher_icons:
+  android: true
+  ios: true
+  image_path: "assets/icon/hommie_icon.png"
