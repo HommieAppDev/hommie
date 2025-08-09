@@ -47,3 +47,4 @@ app.*.map.json
 # iOs & Secrets
 ios/Pods/
 firebase_options.dart
+.env
