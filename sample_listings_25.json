@@ -1,0 +1,5 @@
+{
+  "status": 401,
+  "error": "auth/api-key-invalid",
+  "message": "The provided API key is not valid. Manage API keys on your API dashboard: https://app.rentcast.io/app/api"
+}

@@ -1,502 +1,713 @@
-// listing_detail_screen.dart
-import 'package:flutter/material.dart';
-import 'package:firebase_auth/firebase_auth.dart';
+// lib/listing_detail_screen.dart
+import 'dart:io';
+import 'package:carousel_slider/carousel_slider.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:firebase_auth/firebase_auth.dart';
+import 'package:firebase_storage/firebase_storage.dart';
+import 'package:flutter/material.dart';
+import 'package:image_picker/image_picker.dart';
+import 'package:url_launcher/url_launcher.dart';
+import 'constants/asset_paths.dart'; // avatarOptions, defaultAvatar
+
+// ----------------- Helpers for avatars, profiles, DMs -----------------
+
+Widget _userAvatar(String? keyOrUrl, {double radius = 18}) {
+  if (keyOrUrl == null || keyOrUrl.isEmpty) {
+    return CircleAvatar(radius: radius, backgroundImage: AssetImage(defaultAvatar));
+  }
+  if (avatarOptions.containsKey(keyOrUrl)) {
+    return CircleAvatar(radius: radius, backgroundImage: AssetImage(avatarOptions[keyOrUrl]!));
+  }
+  if (keyOrUrl.startsWith('http')) {
+    return CircleAvatar(radius: radius, backgroundImage: NetworkImage(keyOrUrl));
+  }
+  return CircleAvatar(radius: radius, backgroundImage: AssetImage(defaultAvatar));
+}
+
+// push to a public user profile
+void _openUserProfile(BuildContext context, String uid) {
+  Navigator.pushNamed(context, '/user-profile', arguments: {'uid': uid});
+}
+
+// open/create a DM thread and navigate to chat
+Future<void> _openDM(BuildContext context, String otherUid) async {
+  final me = FirebaseAuth.instance.currentUser?.uid;
+  if (me == null || me == otherUid) return;
+
+  final ids = [me, otherUid]..sort();
+  final threadId = ids.join('_');
+
+  final ref = FirebaseFirestore.instance.collection('threads').doc(threadId);
+  final snap = await ref.get();
+  if (!snap.exists) {
+    await ref.set({
+      'participants': ids,
+      'createdAt': FieldValue.serverTimestamp(),
+      'updatedAt': FieldValue.serverTimestamp(),
+      'lastMessage': null,
+    });
+  } else {
+    await ref.update({'updatedAt': FieldValue.serverTimestamp()});
+  }
+
+  if (context.mounted) {
+    Navigator.pushNamed(context, '/chat', arguments: {'threadId': threadId, 'otherUid': otherUid});
+  }
+}
+
+// ----------------- Screen -----------------
 
 class ListingDetailsScreen extends StatefulWidget {
-  final Map<String, dynamic> listing; // normalized from SearchResultsScreen
-
   const ListingDetailsScreen({super.key, required this.listing});
+  final Map<String, dynamic> listing;
 
   @override
   State<ListingDetailsScreen> createState() => _ListingDetailsScreenState();
 }
 
 class _ListingDetailsScreenState extends State<ListingDetailsScreen> {
-  late final List<String> _photos;
-  late final String _mlsId;
+  final _auth = FirebaseAuth.instance;
+  final _fs = FirebaseFirestore.instance;
+  final _storage = FirebaseStorage.instance;
 
-  int _photoIndex = 0;
-  bool _savingVisited = false;
+  late final String listingId;
 
-  // comments
-  final _commentCtrl = TextEditingController();
-  bool _posting = false;
+  bool _fav = false;
+  bool _visited = false;
+  bool _agreeToPolicy = false;
 
-  // likes
-  bool _liked = false;
-  int _likesCount = 0;
-  bool _likeBusy = false;
+  final _publicCommentCtrl = TextEditingController();
+  final _visitorFeedbackCtrl = TextEditingController();
+
+  User? get _user => _auth.currentUser;
+
+  // Primary photo derived from the listing payload
+  String? get primaryPhoto {
+    final pics = _extractPhotoUrls(widget.listing);
+    return pics.isNotEmpty ? pics.first : null;
+  }
 
   @override
   void initState() {
     super.initState();
-    _photos = _extractPhotos(widget.listing);
-    _mlsId = (widget.listing['mlsId'] ??
-            widget.listing['id'] ??
-            widget.listing['address']?['full'] ??
-            '')
-        .toString();
-    _loadLikeState();
+    listingId = _deriveListingId(widget.listing);
+    _bootstrapFlags();
+    _ensureListingDoc();
   }
 
   @override
   void dispose() {
-    _commentCtrl.dispose();
+    _publicCommentCtrl.dispose();
+    _visitorFeedbackCtrl.dispose();
     super.dispose();
   }
 
-  List<String> _extractPhotos(Map<String, dynamic> l) {
-    final v = l['photos'];
-    if (v is List) return v.whereType<String>().toList();
-    return const <String>[];
+  String _deriveListingId(Map<String, dynamic> l) {
+    return l['id']?.toString() ??
+        l['listingId']?.toString() ??
+        ((l['address']?['line'] ?? '') +
+                (l['address']?['city'] ?? '') +
+                (l['listPrice']?.toString() ?? ''))
+            .hashCode
+            .toString();
   }
 
-  Future<void> _loadLikeState() async {
-    if (_mlsId.isEmpty) return;
-    final uid = FirebaseAuth.instance.currentUser?.uid;
-    final doc =
-        await FirebaseFirestore.instance.collection('listings').doc(_mlsId).get();
-    final data = doc.data() ?? {};
-    final List likes = List.from(data['likes'] ?? const []);
+  Future<void> _bootstrapFlags() async {
+    final u = _user;
+    if (u == null) return;
+    final favRef = _fs.collection('favorites').doc(u.uid).collection('listings').doc(listingId);
+    final visRef = _fs.collection('visited').doc(u.uid).collection('listings').doc(listingId);
+    final fav = await favRef.get();
+    final vis = await visRef.get();
+    if (!mounted) return;
     setState(() {
-      _likesCount = likes.length;
-      _liked = uid != null && likes.contains(uid);
+      _fav = fav.exists;
+      _visited = vis.exists;
     });
   }
 
-  Future<void> _toggleLike() async {
-    if (_mlsId.isEmpty) return;
-    final uid = FirebaseAuth.instance.currentUser?.uid;
-    if (uid == null) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Please sign in to like properties.')),
-      );
-      return;
-    }
-
-    setState(() => _likeBusy = true);
-    try {
-      final ref = FirebaseFirestore.instance.collection('listings').doc(_mlsId);
-      await FirebaseFirestore.instance.runTransaction((tx) async {
-        final snap = await tx.get(ref);
-        final data = snap.data() ?? {};
-        final List likes = List.from(data['likes'] ?? const []);
-        if (likes.contains(uid)) {
-          likes.remove(uid);
-        } else {
-          likes.add(uid);
-        }
-        tx.set(ref, {'likes': likes}, SetOptions(merge: true));
-        _likesCount = likes.length;
-        _liked = likes.contains(uid);
-      });
-      if (mounted) setState(() {});
-    } catch (e) {
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Could not update like: $e')),
-      );
-    } finally {
-      if (mounted) setState(() => _likeBusy = false);
-    }
-  }
-
-  String _priceText(dynamic value) {
-    if (value == null) return '\$—';
-    try {
-      final n = (value is num) ? value.toInt() : int.parse(value.toString());
-      final s = n.toString();
-      final r = s.split('').reversed.toList();
-      final out = StringBuffer();
-      for (int i = 0; i < r.length; i++) {
-        if (i != 0 && i % 3 == 0) out.write(',');
-        out.write(r[i]);
-      }
-      return '\$${out.toString().split('').reversed.join()}';
-    } catch (_) {
-      return '\$${value.toString()}';
-    }
-  }
-
-  String _address(Map<String, dynamic>? a) {
-    if (a == null) return 'Unknown address';
-    final full = (a['full'] ?? a['line'])?.toString();
-    if (full != null && full.trim().isNotEmpty) return full;
-    final parts = [
-      a['streetNumber'],
-      a['streetName'],
-      a['city'],
-      a['state'],
-      a['postalCode'],
-    ].where((e) => e != null && e.toString().trim().isNotEmpty).join(' ');
-    return parts.isEmpty ? 'Unknown address' : parts;
-  }
-
-  Future<void> _markVisited() async {
-    final user = FirebaseAuth.instance.currentUser;
-    if (user == null) {
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Please sign in to save visited homes.')),
-      );
-      return;
-    }
-    if (_mlsId.isEmpty) return;
-
-    setState(() => _savingVisited = true);
-    try {
-      final docRef =
-          FirebaseFirestore.instance.collection('users').doc(user.uid);
-
-      await FirebaseFirestore.instance.runTransaction((tx) async {
-        final snap = await tx.get(docRef);
-        final data = snap.data() ?? {};
-        final List visited = List.from(data['visited'] ?? const []);
-        if (!visited.contains(_mlsId)) visited.add(_mlsId);
-
-        tx.set(
-          docRef,
-          {
-            'visited': visited,
-            'visitedMeta': {
-              _mlsId: {
-                'lastVisitedAt': FieldValue.serverTimestamp(),
-                'address': _address(widget.listing['address'] as Map<String, dynamic>?),
-                'price': widget.listing['listPrice'],
-                'thumb': _photos.isNotEmpty ? _photos.first : null,
-              }
-            }
-          },
-          SetOptions(merge: true),
-        );
-      });
-
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text("Saved to 'Visited Properties'.")),
-      );
-    } catch (e) {
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Could not save: $e')),
-      );
-    } finally {
-      if (mounted) setState(() => _savingVisited = false);
-    }
-  }
-
-  Future<void> _postComment() async {
-    if (_mlsId.isEmpty) return;
-    final user = FirebaseAuth.instance.currentUser;
-    if (user == null) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Please sign in to comment.')),
-      );
-      return;
-    }
-    final text = _commentCtrl.text.trim();
-    if (text.isEmpty) return;
-
-    setState(() => _posting = true);
-    try {
-      await FirebaseFirestore.instance
-          .collection('listings')
-          .doc(_mlsId)
-          .collection('comments')
-          .add({
-        'text': text,
-        'uid': user.uid,
-        'displayName': user.displayName ?? user.email ?? 'User',
-        'createdAt': FieldValue.serverTimestamp(),
-      });
-      _commentCtrl.clear();
-    } catch (e) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Could not post comment: $e')),
-      );
-    } finally {
-      if (mounted) setState(() => _posting = false);
-    }
-  }
-
-  void _openGallery(int start) {
-    showDialog(
-      context: context,
-      barrierColor: const Color.fromRGBO(0, 0, 0, 0.8),
-      builder: (_) {
-        final controller = PageController(initialPage: start);
-        return GestureDetector(
-          onTap: () => Navigator.pop(context),
-          child: Stack(
-            children: [
-              PageView.builder(
-                controller: controller,
-                itemCount: _photos.length,
-                itemBuilder: (_, i) => InteractiveViewer(
-                  child: Container(
-                    color: Colors.black,
-                    alignment: Alignment.center,
-                    child: Image.network(
-                      _photos[i],
-                      fit: BoxFit.contain,
-                      errorBuilder: (_, __, ___) => const Icon(
-                        Icons.broken_image,
-                        color: Colors.white70,
-                        size: 80,
-                      ),
-                    ),
-                  ),
-                ),
-              ),
-              Positioned(
-                right: 16,
-                top: 40,
-                child: IconButton(
-                  color: Colors.white,
-                  icon: const Icon(Icons.close),
-                  onPressed: () => Navigator.pop(context),
-                ),
-              ),
-            ],
-          ),
-        );
+  Future<void> _ensureListingDoc() async {
+    final l = widget.listing;
+    await _fs.collection('listings').doc(listingId).set({
+      'address': {
+        'line': l['address']?['line'] ?? l['address']?['street'],
+        'city': l['address']?['city'],
+        'state': l['address']?['state'] ?? l['address']?['stateCode'],
+        'postalCode': l['address']?['postalCode'] ?? l['address']?['zipCode'],
       },
+      'price': l['listPrice'] ?? l['price'],
+      'beds': l['bedrooms'] ?? l['beds'],
+      'baths': l['bathrooms'] ?? l['baths'],
+      'sqft': l['squareFeet'] ?? l['sqft'],
+      'lat': l['coordinates']?['latitude'] ?? l['lat'],
+      'lng': l['coordinates']?['longitude'] ?? l['lng'],
+      'primaryPhoto': primaryPhoto, // stored for favorites/visited list thumbs
+      'updatedAt': FieldValue.serverTimestamp(),
+    }, SetOptions(merge: true));
+  }
+
+  Future<void> _toggleFavorite() async {
+    final u = _user;
+    if (u == null) return;
+    final ref = _fs.collection('favorites').doc(u.uid).collection('listings').doc(listingId);
+    if (_fav) {
+      await ref.delete();
+      if (mounted) setState(() => _fav = false);
+    } else {
+      await ref.set({'createdAt': FieldValue.serverTimestamp()});
+      if (mounted) setState(() => _fav = true);
+    }
+  }
+
+  Future<void> _toggleVisited() async {
+    final u = _user;
+    if (u == null) return;
+    final ref = _fs.collection('visited').doc(u.uid).collection('listings').doc(listingId);
+    if (_visited) {
+      await ref.delete();
+      if (!mounted) return;
+      setState(() => _visited = false);
+    } else {
+      await ref.set({'visitedAt': FieldValue.serverTimestamp()});
+      if (!mounted) return;
+      setState(() => _visited = true);
+      ScaffoldMessenger.of(context)
+          .showSnackBar(const SnackBar(content: Text("Marked as visited")));
+    }
+  }
+
+  Future<void> _addPublicComment() async {
+    final u = _user;
+    final txt = _publicCommentCtrl.text.trim();
+    if (u == null || txt.isEmpty) return;
+    await _fs.collection('listings').doc(listingId).collection('comments').add({
+      'uid': u.uid,
+      'displayName': u.displayName ?? 'User',
+      'text': txt,
+      'createdAt': FieldValue.serverTimestamp(),
+    });
+    _publicCommentCtrl.clear();
+  }
+
+  Future<void> _addVisitorFeedback() async {
+    if (!_visited) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Only visitors can leave Visitor Feedback.')),
+      );
+      return;
+    }
+    final u = _user;
+    final txt = _visitorFeedbackCtrl.text.trim();
+    if (u == null || txt.isEmpty) return;
+    await _fs.collection('listings').doc(listingId).collection('visitor_feedback').add({
+      'uid': u.uid,
+      'displayName': u.displayName ?? 'Visitor',
+      'text': txt,
+      'createdAt': FieldValue.serverTimestamp(),
+    });
+    _visitorFeedbackCtrl.clear();
+  }
+
+  Future<void> _uploadVisitorPhoto() async {
+    if (!_visited) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Mark as visited to upload visitor photos.')),
+      );
+      return;
+    }
+
+    if (!_agreeToPolicy) {
+      final ok = await _showPhotoPolicyDialog();
+      if (ok != true) return;
+      setState(() => _agreeToPolicy = true);
+    }
+
+    final picker = ImagePicker();
+    final x =
+        await picker.pickImage(source: ImageSource.gallery, maxWidth: 2000, imageQuality: 88);
+    if (x == null) return;
+
+    final u = _user;
+    if (u == null) return;
+    final file = File(x.path);
+    final path =
+        'listing_photos/$listingId/${u.uid}/${DateTime.now().millisecondsSinceEpoch}.jpg';
+
+    final task =
+        await _storage.ref(path).putFile(file, SettableMetadata(contentType: 'image/jpeg'));
+    final storagePath = task.ref.fullPath;
+
+    await _fs.collection('listings').doc(listingId).collection('photos').add({
+      'uid': u.uid,
+      'storagePath': storagePath,
+      'status': 'pending', // moderator approval required
+      'type': 'visitor',
+      'createdAt': FieldValue.serverTimestamp(),
+    });
+
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('Photo uploaded for review.')),
     );
+  }
+
+  Future<bool?> _showPhotoPolicyDialog() {
+    return showDialog<bool>(
+      context: context,
+      builder: (_) => AlertDialog(
+        title: const Text('Visitor Photo Policy'),
+        content: const Text(
+          'Upload only photos you took during your visit.\n\n'
+          '• Do NOT upload interior photos (privacy)\n'
+          '• No faces, license plates, or private information\n'
+          '• No copyrighted MLS photos\n\n'
+          'All uploads are moderated before appearing publicly.',
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(context, false), child: const Text('Cancel')),
+          ElevatedButton(onPressed: () => Navigator.pop(context, true), child: const Text('I Agree')),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _openInMaps(String address) async {
+    final encoded = Uri.encodeComponent(address);
+    final url = Uri.parse('https://www.google.com/maps/search/?api=1&query=$encoded');
+    if (await canLaunchUrl(url)) {
+      await launchUrl(url, mode: LaunchMode.externalApplication);
+    }
   }
 
   @override
   Widget build(BuildContext context) {
     final l = widget.listing;
 
-    final address = _address(l['address'] as Map<String, dynamic>?);
-    final price = _priceText(l['listPrice']);
-    final property = (l['property'] as Map?) ?? {};
-    final beds = property['bedrooms'] ?? l['beds'];
-    final baths = property['bathsFull'] ?? l['baths'];
-    final sqft = property['area'] ?? l['livingArea'];
-    final lot = property['lotSize'] ?? property['lotSizeArea'];
-    final year = property['yearBuilt'];
-    final mls = (l['mls'] as Map?) ?? {};
-    final dom = mls['daysOnMarket'] ?? l['daysOnMarket'];
-    final remarks = l['remarks'] ?? l['publicRemarks'] ?? l['privateRemarks'];
+    final photos = _extractPhotoUrls(l);
+    final price = l['listPrice'] ?? l['price'] ?? 0;
+    final line = l['address']?['line'] ?? l['address']?['street'];
+    final city = l['address']?['city'];
+    final state = l['address']?['state'] ?? l['address']?['stateCode'];
+    final zip = l['address']?['postalCode'] ?? l['address']?['zipCode'];
+    final address = (line != null && line.toString().trim().isNotEmpty)
+        ? '$line, ${city ?? ''}, ${state ?? ''} ${zip ?? ''}'
+            .replaceAll(RegExp(r',\s*,+'), ', ')
+        : '${city ?? ''}, ${state ?? ''}'.trim().replaceAll(RegExp(r',\s*$'), '');
+    final beds = l['bedrooms'] ?? l['beds'];
+    final baths = l['bathrooms'] ?? l['baths'];
+    final sqft = l['squareFeet'] ?? l['sqft'];
+    final type = l['propertyType'] ?? l['type'];
 
     return Scaffold(
-      appBar: AppBar(title: const Text('Listing Details')),
-      floatingActionButton: FloatingActionButton.extended(
-        onPressed: _savingVisited ? null : _markVisited,
-        icon: _savingVisited
-            ? const SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2))
-            : const Icon(Icons.check_circle),
-        label: const Text("I've Visited"),
-      ),
+      appBar: AppBar(title: const Text('Listing')),
       body: ListView(
-        padding: EdgeInsets.zero,
         children: [
-          // --- PHOTO CAROUSEL ---
-          AspectRatio(
-            aspectRatio: 16 / 9,
-            child: Stack(
-              alignment: Alignment.bottomCenter,
-              children: [
-                PageView.builder(
-                  itemCount: _photos.isEmpty ? 1 : _photos.length,
-                  onPageChanged: (i) => setState(() => _photoIndex = i),
-                  itemBuilder: (_, i) {
-                    if (_photos.isEmpty) {
-                      return Container(
-                        color: Colors.grey.shade200,
-                        alignment: Alignment.center,
-                        child: const Icon(Icons.photo, size: 48, color: Colors.grey),
-                      );
-                    }
-                    return GestureDetector(
-                      onTap: () => _openGallery(i),
-                      child: Image.network(
-                        _photos[i],
-                        fit: BoxFit.cover,
-                        errorBuilder: (_, __, ___) => Container(
-                          color: Colors.grey.shade200,
-                          alignment: Alignment.center,
-                          child: const Icon(Icons.broken_image, size: 48, color: Colors.grey),
+          // --- Photos header ---
+          if (photos.isNotEmpty)
+            CarouselSlider(
+              options: CarouselOptions(height: 260, viewportFraction: 1, enableInfiniteScroll: false),
+              items: photos.map((u) {
+                return Builder(
+                  builder: (_) => Stack(
+                    children: [
+                      Positioned.fill(
+                        child: Image.network(
+                          u,
+                          fit: BoxFit.cover,
+                          errorBuilder: (_, __, ___) => Container(
+                            color: Colors.grey.shade200,
+                            alignment: Alignment.center,
+                            child: const Icon(Icons.image_not_supported),
+                          ),
                         ),
+                      ),
+                      Positioned.fill(
+                        child: IgnorePointer(
+                          ignoring: true,
+                          child: Container(
+                            decoration: const BoxDecoration(
+                              gradient: LinearGradient(
+                                begin: Alignment.topCenter,
+                                end: Alignment.bottomCenter,
+                                colors: [Colors.transparent, Color(0x33000000)],
+                              ),
+                            ),
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                );
+              }).toList(),
+            )
+          else
+            Container(
+              height: 200,
+              color: Colors.grey.shade200,
+              alignment: Alignment.center,
+              child: const Text('No photos available'),
+            ),
+
+          // --- Price + quick facts ---
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 16, 16, 8),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text('\$${_fmt(price)}',
+                    style: const TextStyle(fontSize: 30, fontWeight: FontWeight.w800)),
+                const SizedBox(height: 8),
+                InkWell(
+                  onTap: address.isNotEmpty ? () => _openInMaps(address) : null,
+                  child: Text(
+                    address.isEmpty ? 'Address unavailable' : address,
+                    style: TextStyle(
+                      fontSize: 16,
+                      color: address.isEmpty ? Colors.black87 : Colors.blue,
+                      decoration: address.isEmpty ? TextDecoration.none : TextDecoration.underline,
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 12),
+                Wrap(
+                  spacing: 8,
+                  runSpacing: 8,
+                  children: [
+                    _Chip('${beds ?? '-'} bd'),
+                    _Chip('${baths ?? '-'} ba'),
+                    if (sqft != null) _Chip('${_fmt(sqft)} sqft'),
+                    if (type != null) _Chip(type.toString()),
+                  ],
+                ),
+                const SizedBox(height: 12),
+                Row(
+                  children: [
+                    IconButton(
+                      tooltip: 'Save',
+                      icon: Icon(_fav ? Icons.favorite : Icons.favorite_border,
+                          color: _fav ? Colors.red : null),
+                      onPressed: _toggleFavorite,
+                    ),
+                    const SizedBox(width: 4),
+                    ElevatedButton.icon(
+                      onPressed: _toggleVisited,
+                      icon: Icon(_visited ? Icons.check_circle : Icons.check_circle_outline),
+                      label: Text(_visited ? 'Visited' : "I've Visited"),
+                      style: ElevatedButton.styleFrom(shape: const StadiumBorder()),
+                    ),
+                    const Spacer(),
+                    OutlinedButton.icon(
+                      onPressed: _uploadVisitorPhoto,
+                      icon: const Icon(Icons.camera_alt_outlined),
+                      label: const Text('Add Photo'),
+                      style: OutlinedButton.styleFrom(shape: const StadiumBorder()),
+                    ),
+                  ],
+                ),
+              ],
+            ),
+          ),
+
+          const Divider(height: 1),
+
+          // --- Visitor Feedback (readable by all; only visitors can post) ---
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 16, 16, 8),
+            child: Row(
+              children: const [
+                Icon(Icons.verified_user_outlined, size: 20),
+                SizedBox(width: 8),
+                Text('Visitor Feedback',
+                    style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+              ],
+            ),
+          ),
+          StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
+            stream: _fs
+                .collection('listings')
+                .doc(listingId)
+                .collection('visitor_feedback')
+                .orderBy('createdAt', descending: true)
+                .snapshots(),
+            builder: (context, snap) {
+              final docs = snap.data?.docs ?? [];
+              if (docs.isEmpty) {
+                return const Padding(
+                  padding: EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                  child: Text(
+                    'Only visitors can leave feedback about what they saw.\n'
+                    'Be respectful. No interior photos.',
+                    style: TextStyle(color: Colors.black54),
+                  ),
+                );
+              }
+              return ListView.separated(
+                shrinkWrap: true,
+                physics: const NeverScrollableScrollPhysics(),
+                itemCount: docs.length,
+                separatorBuilder: (_, __) => const Divider(height: 1),
+                itemBuilder: (context, i) {
+                  final d = docs[i].data();
+                  final uid = d['uid'] as String?;
+                  if (uid == null) {
+                    return const ListTile(
+                      leading: Icon(Icons.person_outline),
+                      title: Text('Visitor'),
+                      subtitle: Text(''),
+                    );
+                  }
+                  return StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
+                    stream: _fs.collection('users').doc(uid).snapshots(),
+                    builder: (_, userSnap) {
+                      final user = userSnap.data?.data();
+                      final display = user?['displayName'] ?? d['displayName'] ?? 'Visitor';
+                      final avatarKeyOrUrl =
+                          user?['avatarKey'] ?? user?['avatarUrl'] ?? user?['photoURL'];
+                      return ListTile(
+                        leading: GestureDetector(
+                          onTap: () => _openUserProfile(context, uid),
+                          child: _userAvatar(avatarKeyOrUrl),
+                        ),
+                        title: GestureDetector(
+                          onTap: () => _openUserProfile(context, uid),
+                          child: Text(display, style: const TextStyle(fontWeight: FontWeight.w600)),
+                        ),
+                        subtitle: Text(d['text'] ?? ''),
+                        trailing: IconButton(
+                          tooltip: 'Message',
+                          icon: const Icon(Icons.mail_outline),
+                          onPressed: () => _openDM(context, uid),
+                        ),
+                      );
+                    },
+                  );
+                },
+              );
+            },
+          ),
+          if (_visited)
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 8, 16, 16),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: TextField(
+                      controller: _visitorFeedbackCtrl,
+                      decoration: const InputDecoration(
+                        hintText: 'Share what you saw (no interior photos)',
+                        border: OutlineInputBorder(),
+                        isDense: true,
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  ElevatedButton(onPressed: _addVisitorFeedback, child: const Text('Post')),
+                ],
+              ),
+            )
+          else
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 8, 16, 16),
+              child: Text(
+                'Mark as “Visited” to post feedback and upload photos.',
+                style: TextStyle(color: Colors.orange.shade700),
+              ),
+            ),
+
+          // --- Approved visitor photos gallery ---
+          StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
+            stream: _fs
+                .collection('listings')
+                .doc(listingId)
+                .collection('photos')
+                .where('status', isEqualTo: 'approved')
+                .orderBy('createdAt', descending: true)
+                .snapshots(),
+            builder: (context, snap) {
+              final docs = snap.data?.docs ?? [];
+              if (docs.isEmpty) return const SizedBox.shrink();
+              return SizedBox(
+                height: 120,
+                child: ListView.separated(
+                  padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
+                  scrollDirection: Axis.horizontal,
+                  itemCount: docs.length,
+                  separatorBuilder: (_, __) => const SizedBox(width: 12),
+                  itemBuilder: (_, i) {
+                    final storagePath = docs[i].data()['storagePath'] as String?;
+                    return AspectRatio(
+                      aspectRatio: 4 / 3,
+                      child: FutureBuilder<String>(
+                        future: storagePath == null
+                            ? Future.value('')
+                            : _storage.ref(storagePath).getDownloadURL(),
+                        builder: (_, urlSnap) {
+                          final url = urlSnap.data;
+                          if (url == null || url.isEmpty) {
+                            return Container(
+                              color: Colors.grey.shade200,
+                              alignment: Alignment.center,
+                              child: const Text('Loading...'),
+                            );
+                          }
+                          return ClipRRect(
+                            borderRadius: BorderRadius.circular(12),
+                            child: Image.network(
+                              url,
+                              fit: BoxFit.cover,
+                              errorBuilder: (_, __, ___) => Container(
+                                color: Colors.grey.shade200,
+                                alignment: Alignment.center,
+                                child: const Icon(Icons.image_not_supported),
+                              ),
+                            ),
+                          );
+                        },
                       ),
                     );
                   },
                 ),
-                if (_photos.length > 1)
-                  Positioned(
-                    bottom: 10,
-                    child: Container(
-                      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-                      decoration: BoxDecoration(
-                        color: const Color.fromRGBO(0, 0, 0, 0.45),
-                        borderRadius: BorderRadius.circular(12),
-                      ),
-                      child: Text(
-                        '${_photoIndex + 1} / ${_photos.length}',
-                        style: const TextStyle(color: Colors.white),
-                      ),
-                    ),
-                  ),
-              ],
-            ),
+              );
+            },
           ),
 
-          // --- HEADER: PRICE + ADDRESS ---
-          Padding(
-            padding: const EdgeInsets.fromLTRB(16, 14, 16, 6),
-            child: Text(
-              price,
-              style: const TextStyle(fontSize: 26, fontWeight: FontWeight.bold),
-            ),
-          ),
-          Padding(
-            padding: const EdgeInsets.fromLTRB(16, 0, 16, 4),
-            child: Text(
-              address,
-              style: TextStyle(color: Colors.grey.shade700, fontSize: 16),
-            ),
-          ),
+          const Divider(height: 1),
 
-          // --- LIKE ROW ---
+          // --- Public Comments ---
           Padding(
-            padding: const EdgeInsets.fromLTRB(12, 4, 12, 8),
+            padding: const EdgeInsets.fromLTRB(16, 16, 16, 8),
             child: Row(
-              children: [
-                Text('Likes: $_likesCount'),
-                const SizedBox(width: 8),
-                IconButton(
-                  onPressed: _likeBusy ? null : _toggleLike,
-                  icon: Icon(
-                    _liked ? Icons.favorite : Icons.favorite_border,
-                    color: _liked ? Colors.red : null,
-                  ),
-                ),
+              children: const [
+                Icon(Icons.forum_outlined, size: 20),
+                SizedBox(width: 8),
+                Text('Comments', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
               ],
             ),
           ),
-
-          // --- QUICK FACTS ---
-          Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-            child: Wrap(
-              spacing: 18,
-              runSpacing: 8,
-              children: [
-                _fact(Icons.bed, '${beds ?? '—'} bd'),
-                _fact(Icons.bathtub, '${baths ?? '—'} ba'),
-                _fact(Icons.square_foot, '${sqft ?? '—'} sqft'),
-                _fact(Icons.park, lot != null ? '$lot lot' : '— lot'),
-                _fact(Icons.calendar_month, year != null ? '$year built' : '—'),
-                _fact(Icons.timelapse, dom != null ? '$dom DOM' : '— DOM'),
-                if (_mlsId.isNotEmpty) _fact(Icons.confirmation_number, 'MLS $_mlsId'),
-              ],
-            ),
+          StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
+            stream: _fs
+                .collection('listings')
+                .doc(listingId)
+                .collection('comments')
+                .orderBy('createdAt', descending: true)
+                .snapshots(),
+            builder: (context, snap) {
+              final docs = snap.data?.docs ?? [];
+              if (docs.isEmpty) {
+                return const Padding(
+                  padding: EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                  child: Text('Be the first to comment.'),
+                );
+              }
+              return ListView.separated(
+                shrinkWrap: true,
+                physics: const NeverScrollableScrollPhysics(),
+                itemCount: docs.length,
+                separatorBuilder: (_, __) => const Divider(height: 1),
+                itemBuilder: (context, i) {
+                  final c = docs[i].data();
+                  final uid = c['uid'] as String?;
+                  if (uid == null) {
+                    return const ListTile(
+                      leading: Icon(Icons.person_outline),
+                      title: Text('User'),
+                      subtitle: Text(''),
+                    );
+                  }
+                  return StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
+                    stream: _fs.collection('users').doc(uid).snapshots(),
+                    builder: (_, userSnap) {
+                      final user = userSnap.data?.data();
+                      final display = user?['displayName'] ?? c['displayName'] ?? 'User';
+                      final avatarKeyOrUrl =
+                          user?['avatarKey'] ?? user?['avatarUrl'] ?? user?['photoURL'];
+                      return ListTile(
+                        leading: GestureDetector(
+                          onTap: () => _openUserProfile(context, uid),
+                          child: _userAvatar(avatarKeyOrUrl),
+                        ),
+                        title: GestureDetector(
+                          onTap: () => _openUserProfile(context, uid),
+                          child: Text(display, style: const TextStyle(fontWeight: FontWeight.w600)),
+                        ),
+                        subtitle: Text(c['text'] ?? ''),
+                        trailing: IconButton(
+                          tooltip: 'Message',
+                          icon: const Icon(Icons.mail_outline),
+                          onPressed: () => _openDM(context, uid),
+                        ),
+                      );
+                    },
+                  );
+                },
+              );
+            },
           ),
-
-          const Divider(height: 24),
-
-          // --- REMARKS ---
-          if (remarks != null && remarks.toString().trim().isNotEmpty)
-            Padding(
-              padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
-              child: Text(
-                remarks.toString(),
-                style: const TextStyle(fontSize: 16, height: 1.35),
-              ),
-            ),
-
-          const Divider(height: 24),
-
-          // --- COMMENTS HEADER ---
           Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 16.0, vertical: 8),
-            child: Text('Comments', style: Theme.of(context).textTheme.titleMedium),
-          ),
-
-          // --- COMMENT INPUT ---
-          Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 16.0),
+            padding: const EdgeInsets.fromLTRB(16, 8, 16, 24),
             child: Row(
               children: [
                 Expanded(
                   child: TextField(
-                    controller: _commentCtrl,
+                    controller: _publicCommentCtrl,
                     decoration: const InputDecoration(
-                      hintText: 'Add a comment...',
+                      hintText: 'Add a comment',
                       border: OutlineInputBorder(),
                       isDense: true,
                     ),
-                    minLines: 1,
-                    maxLines: 4,
                   ),
                 ),
                 const SizedBox(width: 8),
-                ElevatedButton(
-                  onPressed: _posting ? null : _postComment,
-                  child: _posting
-                      ? const SizedBox(
-                          width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2))
-                      : const Text('Post'),
-                ),
+                ElevatedButton(onPressed: _addPublicComment, child: const Text('Post')),
               ],
             ),
           ),
-
-          // --- COMMENTS LIST ---
-          SizedBox(
-            height: 220,
-            child: StreamBuilder<QuerySnapshot>(
-              stream: (_mlsId.isEmpty)
-                  ? const Stream.empty()
-                  : FirebaseFirestore.instance
-                      .collection('listings')
-                      .doc(_mlsId)
-                      .collection('comments')
-                      .orderBy('createdAt', descending: true)
-                      .snapshots(),
-              builder: (context, snapshot) {
-                if (snapshot.connectionState == ConnectionState.waiting) {
-                  return const Center(child: CircularProgressIndicator());
-                }
-                final docs = snapshot.data?.docs ?? const [];
-                if (docs.isEmpty) {
-                  return const Center(child: Text('No comments yet.'));
-                }
-                return ListView.separated(
-                  padding: const EdgeInsets.fromLTRB(16, 8, 16, 16),
-                  itemCount: docs.length,
-                  separatorBuilder: (_, __) => const Divider(height: 12),
-                  itemBuilder: (_, i) {
-                    final d = docs[i].data() as Map<String, dynamic>;
-                    final name = (d['displayName'] ?? 'User').toString();
-                    final text = (d['text'] ?? '').toString();
-                    return ListTile(
-                      dense: true,
-                      leading: CircleAvatar(
-                        child: Text(name.isNotEmpty ? name[0].toUpperCase() : '?'),
-                      ),
-                      title: Text(name, style: const TextStyle(fontWeight: FontWeight.w600)),
-                      subtitle: Text(text),
-                    );
-                  },
-                );
-              },
-            ),
-          ),
-
-          const SizedBox(height: 90), // keep space for FAB
         ],
       ),
     );
   }
 
-  Widget _fact(IconData icon, String text) {
+  // --------- helpers inside State ---------
+
+  List<String> _extractPhotoUrls(Map<String, dynamic> l) {
+    final raw = l['photos'];
+    if (raw is List) {
+      if (raw.isEmpty) return const [];
+      if (raw.first is String) {
+        return raw.cast<String>();
+      } else if (raw.first is Map) {
+        return raw
+            .map((e) => (e as Map)['url'])
+            .where((u) => u is String && u.toString().isNotEmpty)
+            .cast<String>()
+            .toList();
+      }
+    }
+    return const [];
+  }
+
+  String _fmt(num n) {
+    final s = n.round().toString();
+    final b = StringBuffer();
+    for (int i = 0; i < s.length; i++) {
+      final idx = s.length - i;
+      b.write(s[i]);
+      if (idx > 1 && idx % 3 == 1) b.write(',');
+    }
+    return b.toString();
+  }
+}
+
+class _Chip extends StatelessWidget {
+  const _Chip(this.label, {super.key});
+  final String label;
+
+  @override
+  Widget build(BuildContext context) {
     return Chip(
-      label: Text(text),
-      avatar: Icon(icon, size: 18),
-      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+      label: Text(label),
+      backgroundColor: Colors.grey.shade100,
+      shape: const StadiumBorder(side: BorderSide(color: Colors.black12)),
     );
   }
 }

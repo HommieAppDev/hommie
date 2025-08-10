@@ -1,0 +1,17 @@
+[
+  401,
+  "auth/api-key-invalid",
+  "The provided API key is not valid. Manage API keys on your API dashboard: https://app.rentcast.io/app/api",
+  401,
+  "auth/api-key-invalid",
+  "The provided API key is not valid. Manage API keys on your API dashboard: https://app.rentcast.io/app/api",
+  401,
+  "auth/api-key-invalid",
+  "The provided API key is not valid. Manage API keys on your API dashboard: https://app.rentcast.io/app/api",
+  401,
+  "auth/api-key-invalid",
+  "The provided API key is not valid. Manage API keys on your API dashboard: https://app.rentcast.io/app/api",
+  401,
+  "auth/api-key-invalid",
+  "The provided API key is not valid. Manage API keys on your API dashboard: https://app.rentcast.io/app/api"
+]

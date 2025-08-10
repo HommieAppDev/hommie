@@ -1,32 +1,32 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/foundation.dart';
 import 'package:firebase_core/firebase_core.dart';
 import 'firebase_options.dart';
+import 'package:flutter_dotenv/flutter_dotenv.dart';
 
+import 'avatar_picker_screen.dart';
+import 'welcome_screen.dart';
 import 'signup_screen.dart';
-import 'login_screen.dart';
+import 'home_screen.dart';
 import 'search_screen.dart';
 import 'advanced_search_screen.dart';
-import 'welcome_screen.dart';
-import 'search_results_screen.dart';
 import 'profile_screen.dart';
 import 'edit_profile_screen.dart';
 import 'favorites_screen.dart';
 import 'visited_properties_screen.dart';
-import 'upload_listings.dart'; 
-import 'home_screen.dart';
+import 'search_results_screen.dart';
+import 'listing_detail_screen.dart'; // NOTE: singular "detail" to match your file
+import 'user_profile_screen.dart';
+import 'chat_screen.dart';
 
-void main() async {
+Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  await dotenv.load(fileName: ".env");
   await Firebase.initializeApp(
     options: DefaultFirebaseOptions.currentPlatform,
   );
 
   runApp(const HommieApp());
-
-  // 🔁 TEMPORARY: Upload sample listings AFTER app starts
-  Future.delayed(Duration.zero, () async {
-    await uploadSampleListings();
-  });
 }
 
 class HommieApp extends StatelessWidget {
@@ -36,32 +36,41 @@ class HommieApp extends StatelessWidget {
   Widget build(BuildContext context) {
     return MaterialApp(
       title: 'Hommie',
+      debugShowCheckedModeBanner: false,
       theme: ThemeData(
-        primarySwatch: Colors.blue,
+        colorSchemeSeed: Colors.blue,
+        useMaterial3: true,
       ),
       initialRoute: '/welcome',
       routes: {
-        '/welcome': (context) => WelcomeScreen(), 
+        '/': (context) => WelcomeScreen(),
+        '/welcome': (context) => WelcomeScreen(),
         '/signup': (context) => SignUpScreen(),
-        '/login': (context) => LogInScreen(),
+        '/home': (context) => HomeScreen(),
         '/search': (context) => SearchScreen(),
         '/advanced-search': (context) => AdvancedSearchScreen(),
         '/profile': (context) => ProfileScreen(),
         '/edit-profile': (context) => EditProfileScreen(),
         '/visited': (context) => VisitedPropertiesScreen(),
         '/favorites': (context) => FavoritesScreen(),
-        '/home': (context) => HomeScreen(),  
-        '/search-results': (context) {
-          final args = ModalRoute.of(context)!.settings.arguments as Map<String, dynamic>?;
-
-          return SearchResultsScreen(
-            cityOrZip: args?['query'],
-            radiusMiles: args?['radius'],
-            price: args?['price'],
-            beds: args?['beds'],
-            baths: args?['baths'],
+        '/avatar-picker': (context) => const AvatarPickerScreen(),
+        // Static route; screen reads args via ModalRoute
+        '/search-results': (context) => const SearchResultsScreen(),
+        '/user-profile': (context) => const UserProfileScreen(),
+        '/chat': (context) => const ChatScreen(),
+      },
+      onGenerateRoute: (settings) {
+        // Only handle routes that need constructor args here
+        if (settings.name == '/listing-details') {
+          final args = settings.arguments as Map<String, dynamic>;
+          return MaterialPageRoute(
+            builder: (_) => ListingDetailsScreen(
+              listing: args['listing'],
+            ),
+            settings: settings,
           );
-        },
+        }
+        return null;
       },
     );
   }
