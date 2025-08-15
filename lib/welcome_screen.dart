@@ -101,7 +101,7 @@ class _WelcomeScreenState extends State<WelcomeScreen> {
             height: 180, // tweak height to taste
             child: IgnorePointer(
               child: Opacity(
-                opacity: 0.4, // 0.0 → 1.0
+                opacity: 0.5, // 0.0 → 1.0
                 child: Lottie.asset(
                   'assets/animations/clouds.json',
                   fit: BoxFit.cover,

@@ -71,6 +71,38 @@ class _VisitedPropertiesScreenState extends State<VisitedPropertiesScreen> {
     ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Saved')));
   }
 
+  Future<void> _deleteVisit(String listingId) async {
+    final uid = _user?.uid;
+    if (uid == null) return;
+    await _fs.collection('visited').doc(uid).collection('listings').doc(listingId).delete();
+  }
+
+  Future<void> _pickVisitedDate({
+    required String listingId,
+    required DateTime initialDate,
+  }) async {
+    final uid = _user?.uid;
+    if (uid == null) return;
+    final picked = await showDatePicker(
+      context: context,
+      initialDate: initialDate,
+      firstDate: DateTime(2000),
+      lastDate: DateTime.now().add(const Duration(days: 365)),
+    );
+    if (picked == null) return;
+    await _fs
+        .collection('visited')
+        .doc(uid)
+        .collection('listings')
+        .doc(listingId)
+        .set({'visitedAt': Timestamp.fromDate(picked), 'updatedAt': FieldValue.serverTimestamp()},
+            SetOptions(merge: true));
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text('Visited date updated to ${_fmtDate(picked)}')),
+    );
+  }
+
   void _openDetails(Map<String, dynamic> listing) {
     Navigator.pushNamed(context, '/listing-details', arguments: {'listing': listing});
   }
@@ -128,17 +160,12 @@ class _VisitedPropertiesScreenState extends State<VisitedPropertiesScreen> {
                 stream: listingStream,
                 builder: (_, lsnap) {
                   final l = lsnap.data?.data() ?? {};
-                  if ((l['source'] ?? '') != 'realtor') {
-                    // Show a light "legacy" card with option to expand/remove, or simply skip:
-                    return Card(
-                      margin: const EdgeInsets.only(bottom: 12),
-                      child: ListTile(
-                        leading: const Icon(Icons.history, color: Colors.orange),
-                        title: const Text('Legacy visited listing'),
-                        subtitle: const Text('Saved before the Realtor integration'),
-                      ),
-                    );
+
+                  // HIDE legacy items (anything not explicitly sourced from Realtor)
+                  if (l.isEmpty || (l['source'] ?? '') != 'realtor') {
+                    return const SizedBox.shrink();
                   }
+
                   final addr = (l['address'] as Map?)?.cast<String, dynamic>() ?? const {};
                   final line = (addr['line'] ?? addr['street'] ?? '') as String;
                   final city = (addr['city'] ?? '') as String;
@@ -180,7 +207,7 @@ class _VisitedPropertiesScreenState extends State<VisitedPropertiesScreen> {
                       final visitedAtTs = visitDoc.data()['visitedAt'];
                       final visitedAt = (visitedAtTs is Timestamp)
                           ? visitedAtTs.toDate()
-                          : null;
+                          : DateTime.now();
 
                       // Build merged checklist with defaults
                       final mergedChecklist = <String, bool>{};
@@ -191,235 +218,342 @@ class _VisitedPropertiesScreenState extends State<VisitedPropertiesScreen> {
 
                       final isExpanded = _expanded[listingId] ?? false;
 
-                      return Card(
-                        elevation: 2,
-                        margin: const EdgeInsets.only(bottom: 12),
-                        shape: RoundedRectangleBorder(
-                          borderRadius: BorderRadius.circular(16),
+                      // --- SWIPE-TO-DELETE WRAPPER ---
+                      return Dismissible(
+                        key: ValueKey('visit_$listingId'),
+                        direction: DismissDirection.endToStart,
+                        background: Container(
+                          margin: const EdgeInsets.only(bottom: 12),
+                          decoration: BoxDecoration(
+                            color: Colors.red.shade50,
+                            borderRadius: BorderRadius.circular(16),
+                          ),
+                          alignment: Alignment.centerRight,
+                          padding: const EdgeInsets.symmetric(horizontal: 20),
+                          child: Icon(Icons.delete, color: Colors.red.shade700),
                         ),
-                        child: Column(
-                          children: [
-                            // HEADER (tappable -> opens details)
-                            InkWell(
-                              borderRadius: const BorderRadius.vertical(top: Radius.circular(16)),
-                              onTap: () => _openDetails(detailsPayload),
-                              child: Padding(
-                                padding: const EdgeInsets.all(12),
-                                child: Row(
-                                  crossAxisAlignment: CrossAxisAlignment.start,
-                                  children: [
-                                    // Thumbnail
-                                    ClipRRect(
-                                      borderRadius: BorderRadius.circular(8),
-                                      child: SizedBox(
-                                        width: 64,
-                                        height: 64,
-                                        child: (thumb == null || thumb.isEmpty)
-                                            ? _ph()
-                                            : Image.network(
-                                                thumb,
-                                                fit: BoxFit.cover,
-                                                errorBuilder: (_, __, ___) => _ph(),
-                                              ),
-                                      ),
+                        confirmDismiss: (dir) async {
+                          return await showDialog<bool>(
+                                context: context,
+                                builder: (_) => AlertDialog(
+                                  title: const Text('Remove visited property?'),
+                                  content: const Text('This will delete your notes, checklist, and rating for this home.'),
+                                  actions: [
+                                    TextButton(
+                                      onPressed: () => Navigator.pop(context, false),
+                                      child: const Text('Cancel'),
                                     ),
-                                    const SizedBox(width: 12),
-                                    // Title + subtitle
-                                    Expanded(
-                                      child: Column(
-                                        crossAxisAlignment: CrossAxisAlignment.start,
-                                        children: [
-                                          Row(
-                                            children: [
-                                              Flexible(
-                                                child: Text(
-                                                  price == null ? 'Price unavailable' : '\$${_fmtNum(price)}',
-                                                  maxLines: 1,
-                                                  overflow: TextOverflow.ellipsis,
-                                                  style: const TextStyle(fontWeight: FontWeight.w700),
+                                    TextButton(
+                                      onPressed: () => Navigator.pop(context, true),
+                                      child: const Text('Delete'),
+                                    ),
+                                  ],
+                                ),
+                              ) ??
+                              false;
+                        },
+                        onDismissed: (_) async {
+                          await _deleteVisit(listingId);
+                          if (!mounted) return;
+                          ScaffoldMessenger.of(context).showSnackBar(
+                            const SnackBar(content: Text('Removed from visited')),
+                          );
+                        },
+                        child: Card(
+                          elevation: 2,
+                          margin: const EdgeInsets.only(bottom: 12),
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(16),
+                          ),
+                          child: Column(
+                            children: [
+                              // HEADER (tappable -> opens details)
+                              InkWell(
+                                borderRadius:
+                                    const BorderRadius.vertical(top: Radius.circular(16)),
+                                onTap: () => _openDetails(detailsPayload),
+                                child: Padding(
+                                  padding: const EdgeInsets.all(12),
+                                  child: Row(
+                                    crossAxisAlignment: CrossAxisAlignment.start,
+                                    children: [
+                                      // Thumbnail
+                                      ClipRRect(
+                                        borderRadius: BorderRadius.circular(8),
+                                        child: SizedBox(
+                                          width: 64,
+                                          height: 64,
+                                          child: (thumb == null || thumb.isEmpty)
+                                              ? _ph()
+                                              : Image.network(
+                                                  thumb,
+                                                  fit: BoxFit.cover,
+                                                  errorBuilder: (_, __, ___) => _ph(),
                                                 ),
-                                              ),
-                                              const SizedBox(width: 8),
-                                              if (visitedAt != null)
-                                                Container(
-                                                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-                                                  decoration: BoxDecoration(
-                                                    color: Colors.blueGrey.shade50,
-                                                    borderRadius: BorderRadius.circular(999),
-                                                    border: Border.all(color: Colors.blueGrey.shade200),
-                                                  ),
+                                        ),
+                                      ),
+                                      const SizedBox(width: 12),
+                                      // Title + subtitle
+                                      Expanded(
+                                        child: Column(
+                                          crossAxisAlignment: CrossAxisAlignment.start,
+                                          children: [
+                                            Row(
+                                              children: [
+                                                Flexible(
                                                   child: Text(
-                                                    'Visited ${_fmtDate(visitedAt)}',
-                                                    style: TextStyle(
-                                                      color: Colors.blueGrey.shade700,
-                                                      fontSize: 11,
-                                                      fontWeight: FontWeight.w600,
+                                                    price == null
+                                                        ? 'Price unavailable'
+                                                        : '\$${_fmtNum(price)}',
+                                                    maxLines: 1,
+                                                    overflow: TextOverflow.ellipsis,
+                                                    style: const TextStyle(
+                                                        fontWeight: FontWeight.w700),
+                                                  ),
+                                                ),
+                                                const SizedBox(width: 8),
+                                                // TAP TO CHANGE DATE
+                                                InkWell(
+                                                  borderRadius: BorderRadius.circular(999),
+                                                  onTap: () => _pickVisitedDate(
+                                                    listingId: listingId,
+                                                    initialDate: visitedAt,
+                                                  ),
+                                                  child: Container(
+                                                    padding: const EdgeInsets.symmetric(
+                                                        horizontal: 8, vertical: 4),
+                                                    decoration: BoxDecoration(
+                                                      color: Colors.blueGrey.shade50,
+                                                      borderRadius:
+                                                          BorderRadius.circular(999),
+                                                      border: Border.all(
+                                                          color: Colors.blueGrey.shade200),
+                                                    ),
+                                                    child: Row(
+                                                      mainAxisSize: MainAxisSize.min,
+                                                      children: [
+                                                        Icon(Icons.event,
+                                                            size: 14,
+                                                            color:
+                                                                Colors.blueGrey.shade700),
+                                                        const SizedBox(width: 4),
+                                                        Text(
+                                                          'Visited ${_fmtDate(visitedAt)}',
+                                                          style: TextStyle(
+                                                            color: Colors
+                                                                .blueGrey.shade700,
+                                                            fontSize: 11,
+                                                            fontWeight:
+                                                                FontWeight.w600,
+                                                          ),
+                                                        ),
+                                                      ],
                                                     ),
                                                   ),
                                                 ),
-                                            ],
+                                              ],
+                                            ),
+                                            const SizedBox(height: 4),
+                                            Text(
+                                              [
+                                                if (line.trim().isNotEmpty) line,
+                                                [city, state]
+                                                    .where((s) => s
+                                                        .toString()
+                                                        .trim()
+                                                        .isNotEmpty)
+                                                    .join(', '),
+                                              ]
+                                                  .where((s) =>
+                                                      s.toString().trim().isNotEmpty)
+                                                  .join(' • '),
+                                              maxLines: 2,
+                                              overflow: TextOverflow.ellipsis,
+                                              style:
+                                                  const TextStyle(color: Colors.black54),
+                                            ),
+                                            const SizedBox(height: 6),
+                                            Wrap(
+                                              spacing: 10,
+                                              runSpacing: 6,
+                                              children: [
+                                                _MiniFact(Icons.bed_outlined,
+                                                    '${beds ?? '-'} bd'),
+                                                _MiniFact(Icons.bathtub_outlined,
+                                                    '${baths ?? '-'} ba'),
+                                                if (sqft != null)
+                                                  _MiniFact(Icons.square_foot,
+                                                      '${_fmtNum(sqft)} sqft'),
+                                              ],
+                                            ),
+                                          ],
+                                        ),
+                                      ),
+                                      const SizedBox(width: 8),
+                                      // Actions: open + expand
+                                      Column(
+                                        children: [
+                                          IconButton(
+                                            tooltip: 'Open listing',
+                                            onPressed: () =>
+                                                _openDetails(detailsPayload),
+                                            icon: const Icon(Icons.open_in_new),
                                           ),
-                                          const SizedBox(height: 4),
-                                          Text(
-                                            [
-                                              if (line.trim().isNotEmpty) line,
-                                              [city, state]
-                                                  .where((s) => s.toString().trim().isNotEmpty)
-                                                  .join(', '),
-                                            ]
-                                                .where((s) => s.toString().trim().isNotEmpty)
-                                                .join(' • '),
-                                            maxLines: 2,
-                                            overflow: TextOverflow.ellipsis,
-                                            style: const TextStyle(color: Colors.black54),
-                                          ),
-                                          const SizedBox(height: 6),
-                                          Wrap(
-                                            spacing: 10,
-                                            runSpacing: 6,
-                                            children: [
-                                              _MiniFact(Icons.bed_outlined, '${beds ?? '-'} bd'),
-                                              _MiniFact(Icons.bathtub_outlined, '${baths ?? '-'} ba'),
-                                              if (sqft != null) _MiniFact(Icons.square_foot, '${_fmtNum(sqft)} sqft'),
-                                            ],
+                                          IconButton(
+                                            tooltip:
+                                                ( _expanded[listingId] ?? false )
+                                                    ? 'Collapse'
+                                                    : 'Expand',
+                                            onPressed: () => setState(() =>
+                                                _expanded[listingId] =
+                                                    !(_expanded[listingId] ?? false)),
+                                            icon: AnimatedRotation(
+                                              duration:
+                                                  const Duration(milliseconds: 200),
+                                              turns: (_expanded[listingId] ?? false)
+                                                  ? 0.5
+                                                  : 0,
+                                              child: const Icon(Icons.expand_more),
+                                            ),
                                           ),
                                         ],
                                       ),
-                                    ),
-                                    const SizedBox(width: 8),
-                                    // Actions: open + expand
-                                    Column(
-                                      children: [
-                                        IconButton(
-                                          tooltip: 'Open listing',
-                                          onPressed: () => _openDetails(detailsPayload),
-                                          icon: const Icon(Icons.open_in_new),
-                                        ),
-                                        IconButton(
-                                          tooltip: isExpanded ? 'Collapse' : 'Expand',
-                                          onPressed: () => setState(() => _expanded[listingId] = !isExpanded),
-                                          icon: AnimatedRotation(
-                                            duration: const Duration(milliseconds: 200),
-                                            turns: isExpanded ? 0.5 : 0,
-                                            child: const Icon(Icons.expand_more),
-                                          ),
-                                        ),
-                                      ],
-                                    ),
-                                  ],
+                                    ],
+                                  ),
                                 ),
                               ),
-                            ),
 
-                            // EXPANDED CONTENT
-                            AnimatedCrossFade(
-                              crossFadeState: isExpanded ? CrossFadeState.showFirst : CrossFadeState.showSecond,
-                              duration: const Duration(milliseconds: 200),
-                              firstChild: Padding(
-                                padding: const EdgeInsets.fromLTRB(12, 0, 12, 12),
-                                child: Column(
-                                  crossAxisAlignment: CrossAxisAlignment.stretch,
-                                  children: [
-                                    // Rating row
-                                    Row(
-                                      children: [
-                                        const Text('Your rating: ', style: TextStyle(fontWeight: FontWeight.w600)),
-                                        for (int s = 1; s <= 5; s++)
-                                          IconButton(
-                                            padding: EdgeInsets.zero,
-                                            constraints: const BoxConstraints(),
-                                            icon: Icon(
-                                              Icons.star,
-                                              color: s <= rating ? Colors.amber : Colors.grey.shade400,
+                              // EXPANDED CONTENT
+                              AnimatedCrossFade(
+                                crossFadeState: (_expanded[listingId] ?? false)
+                                    ? CrossFadeState.showFirst
+                                    : CrossFadeState.showSecond,
+                                duration: const Duration(milliseconds: 200),
+                                firstChild: Padding(
+                                  padding:
+                                      const EdgeInsets.fromLTRB(12, 0, 12, 12),
+                                  child: Column(
+                                    crossAxisAlignment:
+                                        CrossAxisAlignment.stretch,
+                                    children: [
+                                      // Rating row
+                                      Row(
+                                        children: [
+                                          const Text('Your rating: ',
+                                              style: TextStyle(
+                                                  fontWeight: FontWeight.w600)),
+                                          for (int s = 1; s <= 5; s++)
+                                            IconButton(
+                                              padding: EdgeInsets.zero,
+                                              constraints: const BoxConstraints(),
+                                              icon: Icon(
+                                                Icons.star,
+                                                color: s <= rating
+                                                    ? Colors.amber
+                                                    : Colors.grey.shade400,
+                                              ),
+                                              onPressed: () => _saveNotes(
+                                                  listingId: listingId,
+                                                  rating: s),
                                             ),
-                                            onPressed: () => _saveNotes(listingId: listingId, rating: s),
-                                          ),
-                                      ],
-                                    ),
-                                    const SizedBox(height: 8),
+                                        ],
+                                      ),
+                                      const SizedBox(height: 8),
 
-                                    // Checklist
-                                    Container(
-                                      decoration: BoxDecoration(
-                                        color: Colors.grey.shade50,
-                                        borderRadius: BorderRadius.circular(12),
-                                        border: Border.all(color: Colors.black12),
-                                      ),
-                                      child: Column(
-                                        children: mergedChecklist.entries.map((e) {
-                                          return CheckboxListTile(
-                                            dense: true,
-                                            title: Text(e.key),
-                                            value: e.value,
-                                            onChanged: (v) => _toggleChecklist(
-                                              listingId: listingId,
-                                              key: e.key,
-                                              value: v ?? false,
-                                            ),
-                                          );
-                                        }).toList(),
-                                      ),
-                                    ),
-                                    const SizedBox(height: 12),
-
-                                    // Notes
-                                    TextField(
-                                      controller: notesCtrl,
-                                      maxLines: 4,
-                                      decoration: const InputDecoration(
-                                        labelText: 'Your private notes',
-                                        alignLabelWithHint: true,
-                                        border: OutlineInputBorder(),
-                                      ),
-                                    ),
-                                    const SizedBox(height: 8),
-                                    // Next steps
-                                    TextField(
-                                      controller: nextCtrl,
-                                      maxLines: 2,
-                                      decoration: const InputDecoration(
-                                        labelText: 'Next steps (e.g., schedule inspection, request HOA docs)',
-                                        alignLabelWithHint: true,
-                                        border: OutlineInputBorder(),
-                                      ),
-                                    ),
-                                    const SizedBox(height: 10),
-
-                                    // Save actions
-                                    Row(
-                                      children: [
-                                        Expanded(
-                                          child: ElevatedButton.icon(
-                                            onPressed: () => _saveNotes(
-                                              listingId: listingId,
-                                              notes: notesCtrl.text.trim(),
-                                              nextSteps: nextCtrl.text.trim(),
-                                            ),
-                                            icon: const Icon(Icons.save),
-                                            label: const Text('Save Notes'),
-                                            style: ElevatedButton.styleFrom(
-                                              minimumSize: const Size.fromHeight(44),
-                                              shape: const StadiumBorder(),
-                                            ),
-                                          ),
+                                      // Checklist
+                                      Container(
+                                        decoration: BoxDecoration(
+                                          color: Colors.grey.shade50,
+                                          borderRadius:
+                                              BorderRadius.circular(12),
+                                          border:
+                                              Border.all(color: Colors.black12),
                                         ),
-                                        const SizedBox(width: 10),
-                                        OutlinedButton.icon(
-                                          onPressed: () {
-                                            _saveNotes(listingId: listingId, notes: '', nextSteps: '');
-                                          },
-                                          icon: const Icon(Icons.clear),
-                                          label: const Text('Clear'),
-                                          style: OutlinedButton.styleFrom(shape: const StadiumBorder()),
+                                        child: Column(
+                                          children: mergedChecklist.entries
+                                              .map((e) {
+                                            return CheckboxListTile(
+                                              dense: true,
+                                              title: Text(e.key),
+                                              value: e.value,
+                                              onChanged: (v) => _toggleChecklist(
+                                                listingId: listingId,
+                                                key: e.key,
+                                                value: v ?? false,
+                                              ),
+                                            );
+                                          }).toList(),
                                         ),
-                                      ],
-                                    ),
-                                  ],
+                                      ),
+                                      const SizedBox(height: 12),
+
+                                      // Notes
+                                      TextField(
+                                        controller: notesCtrl,
+                                        maxLines: 4,
+                                        decoration: const InputDecoration(
+                                          labelText: 'Your private notes',
+                                          alignLabelWithHint: true,
+                                          border: OutlineInputBorder(),
+                                        ),
+                                      ),
+                                      const SizedBox(height: 8),
+                                      // Next steps
+                                      TextField(
+                                        controller: nextCtrl,
+                                        maxLines: 2,
+                                        decoration: const InputDecoration(
+                                          labelText:
+                                              'Next steps (e.g., schedule inspection, request HOA docs)',
+                                          alignLabelWithHint: true,
+                                          border: OutlineInputBorder(),
+                                        ),
+                                      ),
+                                      const SizedBox(height: 10),
+
+                                      // Save actions
+                                      Row(
+                                        children: [
+                                          Expanded(
+                                            child: ElevatedButton.icon(
+                                              onPressed: () => _saveNotes(
+                                                listingId: listingId,
+                                                notes: notesCtrl.text.trim(),
+                                                nextSteps:
+                                                    nextCtrl.text.trim(),
+                                              ),
+                                              icon: const Icon(Icons.save),
+                                              label: const Text('Save Notes'),
+                                              style: ElevatedButton.styleFrom(
+                                                minimumSize:
+                                                    const Size.fromHeight(44),
+                                                shape: const StadiumBorder(),
+                                              ),
+                                            ),
+                                          ),
+                                          const SizedBox(width: 10),
+                                          OutlinedButton.icon(
+                                            onPressed: () {
+                                              _saveNotes(
+                                                  listingId: listingId,
+                                                  notes: '',
+                                                  nextSteps: '');
+                                            },
+                                            icon: const Icon(Icons.clear),
+                                            label: const Text('Clear'),
+                                            style: OutlinedButton.styleFrom(
+                                                shape:
+                                                    const StadiumBorder()),
+                                          ),
+                                        ],
+                                      ),
+                                    ],
+                                  ),
                                 ),
+                                secondChild: const SizedBox.shrink(),
                               ),
-                              secondChild: const SizedBox.shrink(),
-                            ),
-                          ],
+                            ],
+                          ),
                         ),
                       );
                     },

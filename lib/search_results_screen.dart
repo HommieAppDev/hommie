@@ -1,973 +1,777 @@
-// lib/search_results_screen.dart
-import 'dart:async';
-import 'dart:convert';
-import 'dart:math';
-
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
-import 'package:flutter_map/flutter_map.dart';
-import 'package:latlong2/latlong.dart';
-import 'package:flutter_dotenv/flutter_dotenv.dart';
-import 'package:url_launcher/url_launcher.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
+import 'package:share_plus/share_plus.dart';
+import 'dart:async';
+import 'dart:math';
+import 'package:flutter_dotenv/flutter_dotenv.dart';
 import 'package:hommie/data/realtor_api_service.dart';
+import 'package:hommie/widgets/listing_media.dart';
+import 'package:cached_network_image/cached_network_image.dart';
+import 'package:flutter/foundation.dart';
+import 'package:webview_flutter/webview_flutter.dart';
+import 'debug/image_logging.dart';
 
-class SearchResultsScreen extends StatefulWidget {
-  const SearchResultsScreen({super.key});
-  @override
-  State<SearchResultsScreen> createState() => _SearchResultsScreenState();
+// Helper to robustly extract virtual tour URLs from listing objects
+List<String> _extractVirtualTours(Map<String, dynamic> l) {
+  final urls = <String>[];
+  void add(dynamic v) {
+    if (v is String && v.trim().isNotEmpty) urls.add(v.trim());
+  }
+  final vt = l['virtual_tours'] ?? l['virtualTours'] ?? l['tours'] ?? l['matterport'];
+  if (vt is List) {
+    for (final item in vt) {
+      if (item is String) add(item);
+      if (item is Map) {
+        add(item['url']);
+        add(item['href']);
+        add(item['tour_url']);
+        add(item['matterport_url']);
+      }
+    }
+  } else if (vt is String) {
+    add(vt);
+  }
+  add(l['unbranded_virtual_tour']);
+  add(l['branded_virtual_tour']);
+  return urls.toSet().toList();
 }
 
-enum _SortMode { newest, priceLow, priceHigh, beds, sqft, dom }
+// Modern WebView widget for virtual tours
+class InAppTourWebView extends StatefulWidget {
+  final String url;
+  const InAppTourWebView({super.key, required this.url});
 
-class _SearchResultsScreenState extends State<SearchResultsScreen> 
+  @override
+  State<InAppTourWebView> createState() => _InAppTourWebViewState();
+}
 
-  // The full implementation is below (see the rest of your file).
-  // ---- API ----
-  late final RealtorApiService _realtor = RealtorApiService();
-
-  // UI
-  bool _loading = true;
-  bool _mapView = false;
-  bool _loadingMore = false;
-  _SortMode _sortMode = _SortMode.newest;
-
-  // Data
-  List<Map<String, dynamic>> _listings = [];
-  int _offset = 0;
-  final int _pageSize = 50;
-
-  // Query (from args)
-  String? _city;
-  String? _state;
-  String? _zip;
-  double _radiusMiles = 10;
-
-  int? _bedsFilter;
-  double? _bathsFilter;
-  int? _minPrice;
-  int? _maxPrice;
-  int? _minSqft;
-  String? _propertyType;
-  bool? _hasGarage;
-
-  // Extras
-  bool? _pool, _pets, _waterfront, _views, _basement, _hasOpenHouse;
-  int? _domMax, _yearBuiltMin, _hoaMax;
-  double? _lotAcresMin;
-
-  // Map stuff
-  final _mapController = MapController();
-  bool _mapDirty = false;
-  bool _isMapReady = false;
-  double? _lastZoom;
-  Map<String, dynamic>? _selectedOnMap;
-
-  // Simple cache
-  final Map<String, List<Map<String, dynamic>>> _cache = {};
-
-  Map<String, dynamic>? get _args =>
-      ModalRoute.of(context)?.settings.arguments as Map<String, dynamic>?;
-
-  // ---- Favorites plumbing ----
-  final _auth = FirebaseAuth.instance;
-  final _fs = FirebaseFirestore.instance;
-  Set<String> _favIDs = {};
+class _InAppTourWebViewState extends State<InAppTourWebView> {
+  late final WebViewController _controller;
 
   @override
   void initState() {
     super.initState();
-    WidgetsBinding.instance.addPostFrameCallback((_) async {
-      final a = _args ?? {};
-      _city = a['city'] as String?;
-      _state = a['state'] as String?;
-      _zip = a['zip'] as String?;
-      _radiusMiles = (a['radiusMiles'] as num?)?.toDouble() ?? 10.0;
-
-      _bedsFilter = a['beds'] as int?;
-      _bathsFilter = (a['baths'] is int)
-          ? (a['baths'] as int).toDouble()
-          : (a['baths'] as num?)?.toDouble();
-
-      _minPrice = a['minPrice'] as int?;
-      _maxPrice = a['maxPrice'] as int?;
-      _minSqft = a['minSqft'] as int?;
-      _propertyType = a['propertyType'] as String?;
-      _hasGarage = (a['hasGarage'] ?? a['garage']) as bool?;
-
-      // Extras
-      _pool         = a['pool'] as bool?;
-      _pets         = a['pets'] as bool?;
-      _waterfront   = a['waterfront'] as bool?;
-      _views        = a['views'] as bool?;
-      _basement     = a['basement'] as bool?;
-      _hasOpenHouse = a['hasOpenHouse'] as bool?;
-      _domMax       = a['domMax'] as int?;
-      _yearBuiltMin = a['yearBuiltMin'] as int?;
-      _lotAcresMin  = (a['lotAcresMin'] as num?)?.toDouble();
-      _hoaMax       = a['hoaMax'] as int?;
-
-      await _loadFavs();       // hydrate hearts
-      await _fetch(reset: true);
-    });
+    _controller = WebViewController()
+      ..setJavaScriptMode(JavaScriptMode.unrestricted)
+      ..setBackgroundColor(const Color(0x00000000))
+      ..setNavigationDelegate(
+        NavigationDelegate(
+          onNavigationRequest: (req) => NavigationDecision.navigate,
+        ),
+      )
+      ..loadRequest(Uri.parse(widget.url));
   }
 
-  // ——— Debug helper: long-press title to copy 1 raw result ———
-  Future<void> _copyRawSample() async {
-    try {
-      final raw = await _realtor.searchByLocationRaw(
-        zip: _zip, city: _city, state: _state, status: 'for_sale', limit: 1,
-      );
-      if (raw.isEmpty) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('No sample found for this search.')),
-        );
-        return;
-      }
-      final pretty = const JsonEncoder.withIndent('  ').convert(raw.first);
-      await Clipboard.setData(ClipboardData(text: pretty));
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Copied one raw listing to clipboard.')),
-      );
-    } catch (e) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Couldn’t copy sample: $e')),
-      );
-    }
-  }
-
-  // ---------- Favorites helpers ----------
-  Future<void> _loadFavs() async {
-    final u = _auth.currentUser;
-    if (u == null) return;
-    final qs = await _fs.collection('favorites').doc(u.uid).collection('listings').get();
-    setState(() => _favIDs = qs.docs.map((d) => d.id).toSet());
-  }
-
-  String _deriveListingId(Map<String, dynamic> l) {
-    return l['id']?.toString()
-        ?? l['property_id']?.toString()
-        ?? l['listingId']?.toString()
-        ?? ('${_addrLine(l) ?? ''}${_addrCity(l) ?? ''}${l['price'] ?? ''}').hashCode.toString();
-  }
-
-  Future<void> _ensureListingDoc(Map<String, dynamic> l, String id) async {
-    final photos = _ListingCard._extractPhotoUrls(l);
-    final primaryPhoto = photos.isNotEmpty ? photos.first : null;
-
-    // best-effort address fields
-    final a = l['address'];
-    final addr = <String, dynamic>{
-      'line': _addrLine(l) ?? '',
-      'city': _addrCity(l) ?? '',
-      'state': _addrState(l) ?? '',
-      'postalCode': (a is Map ? (a['zip'] ?? a['postalCode']) : null) ??
-          l['zip'] ?? l['zipCode'] ?? '',
-    };
-
-    await _fs.collection('listings').doc(id).set({
-      'address': addr,
-      'price': l['price'] ?? l['listPrice'],
-      'beds' : _bedsValue(l),
-      'baths': _bathsValue(l),
-      'sqft' : l['sqft'] ?? l['squareFeet'],
-      'lat'  : l['lat'] ?? l['coordinates']?['latitude'],
-      'lng'  : l['lon'] ?? l['lng'] ?? l['coordinates']?['longitude'],
-      if (primaryPhoto != null) 'primaryPhoto': primaryPhoto,
-      'source'   : 'realtor',
-      'provider' : 'rapidapi',
-      'updatedAt': FieldValue.serverTimestamp(),
-    }, SetOptions(merge: true));
-  }
-
-  Future<void> _toggleFavoriteFromList(Map<String, dynamic> l) async {
-    final u = _auth.currentUser;
-    if (u == null) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Please sign in to save favorites.')),
-      );
-      return;
-    }
-    final id = _deriveListingId(l);
-    final ref = _fs.collection('favorites').doc(u.uid).collection('listings').doc(id);
-    final isFav = _favIDs.contains(id);
-
-    // optimistic UI
-    setState(() {
-      if (isFav) _favIDs.remove(id); else _favIDs.add(id);
-    });
-
-    try {
-      if (isFav) {
-        await ref.delete();
-      } else {
-        await _ensureListingDoc(l, id); // mirror first
-        await ref.set({'createdAt': FieldValue.serverTimestamp()});
-      }
-    } catch (e) {
-      // revert
-      setState(() {
-        if (isFav) _favIDs.add(id); else _favIDs.remove(id);
-      });
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Couldn’t update favorite: $e')),
-        );
-      }
-    }
-  }
-
-  // ---------------- Fetching ----------------
-  Future<void> _fetch({
-    bool reset = false,
-    double? centerLat,
-    double? centerLng,
-  }) async {
-    final keyVal = dotenv.env['RAPIDAPI_KEY'] ?? '';
-    if (keyVal.isEmpty) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Missing RapidAPI key (.env RAPIDAPI_KEY).')),
-        );
-      }
-      return;
-    }
-
-    if (reset) {
-      setState(() {
-        _loading = true;
-        _offset = 0;
-      });
-    }
-
-    // Cache key
-    final key = (centerLat != null && centerLng != null)
-        ? _tileKey(centerLat, centerLng, _radiusMiles)
-        : 'CS:${_city ?? ''}|ST:${_state ?? ''}|ZIP:${_zip ?? ''}|R:$_radiusMiles'
-          '|B:${_bedsFilter ?? '-'}|Ba:${_bathsFilter ?? '-'}|P:${_minPrice ?? '-'}-${_maxPrice ?? '-'}'
-          '|SQ:${_minSqft ?? '-'}|T:${_propertyType ?? '-'}|G:${_hasGarage ?? '-'}'
-          '|X:${_pool ?? '-'}${_pets ?? '-'}${_waterfront ?? '-'}${_views ?? '-'}${_basement ?? '-'}'
-          '|Y:${_domMax ?? '-'}${_yearBuiltMin ?? '-'}${_lotAcresMin ?? '-'}${_hoaMax ?? '-'}${_hasOpenHouse ?? '-'}'
-          '|O:$_offset|S:$_sortMode';
-
-    if (reset && _cache.containsKey(key)) {
-      setState(() {
-        _listings = List<Map<String, dynamic>>.from(_cache[key]!);
-        _applyClientSorting(_listings);
-        _loading = false;
-      });
-      return;
-    }
-
-    try {
-      List<Map<String, dynamic>> mapped = [];
-
-      if (centerLat != null && centerLng != null) {
-        try {
-          final data = await _realtor.searchByCoordinates(
-            lat: centerLat,
-            lon: centerLng,
-            radiusMiles: _radiusMiles,
-            limit: _pageSize,
-            offset: _offset,
-            status: 'for_sale',
-            propertyType: _propertyType,
-            beds: _bedsFilter,
-            baths: _bathsFilter,
-          );
-          mapped = data;
-        } catch (_) {/* fall back below */}
-      }
-
-      if (mapped.isEmpty) {
-        final data = await _realtor.searchByLocation(
-          zip: _zip,
-          city: _city,
-          state: _state,
-          status: 'for_sale',
-          limit: _pageSize,
-          offset: _offset,
-          propertyType: _propertyType,
-          beds: _bedsFilter,
-          baths: _bathsFilter,
-        );
-        mapped = data;
-      }
-
-      // ---------- Client-side filters ----------
-      if (_minPrice != null || _maxPrice != null) {
-        mapped = mapped.where((l) {
-          final p = _num(l['price']);
-          if (p == null) return false;
-          if (_minPrice != null && p < _minPrice!) return false;
-          if (_maxPrice != null && p > _maxPrice!) return false;
-          return true;
-        }).toList();
-      }
-      if (_minSqft != null) {
-        mapped = mapped.where((l) {
-          final s = _num(l['sqft']);
-          return s == null ? false : s >= _minSqft!;
-        }).toList();
-      }
-      if (_hasGarage == true) {
-        mapped = mapped.where((l) {
-          final g = l['garage'];
-          if (g == null) return false;
-          if (g is num) return g > 0;
-          if (g is String) return g.toLowerCase().contains('garage');
-          return false;
-        }).toList();
-      }
-
-      // Extras (best-effort text match)
-      String _t(Map<String, dynamic> l) =>
-          '${(l['description'] ?? '').toString().toLowerCase()} '
-          '${(l['features'] ?? '').toString().toLowerCase()}';
-      if (_pool == true)        mapped = mapped.where((l) => _t(l).contains('pool')).toList();
-      if (_pets == true)        mapped = mapped.where((l) => _t(l).contains('pets')).toList();
-      if (_waterfront == true)  mapped = mapped.where((l) => _t(l).contains('waterfront')).toList();
-      if (_views == true)       mapped = mapped.where((l) => _t(l).contains('view')).toList();
-      if (_basement == true)    mapped = mapped.where((l) => _t(l).contains('basement')).toList();
-      if (_domMax != null)      mapped = mapped.where((l) {
-        final n = (l['dom'] ?? l['daysOnMarket']);
-        final v = (n is num) ? n.toInt() : int.tryParse('$n');
-        return v == null ? true : v <= _domMax!;
-      }).toList();
-      if (_yearBuiltMin != null) mapped = mapped.where((l) {
-        final y = l['yearBuilt'] ?? l['year_built'] ?? l['year'];
-        final v = (y is num) ? y.toInt() : int.tryParse('$y');
-        return v == null ? true : v >= _yearBuiltMin!;
-      }).toList();
-      if (_lotAcresMin != null) mapped = mapped.where((l) {
-        final acres = l['lotAcres'] ?? l['lot_size_acres'];
-        final sqft  = l['lotSize'] ?? l['lot_sqft'];
-        double? lotInAcres;
-        if (acres is num) lotInAcres = acres.toDouble();
-        if (lotInAcres == null && sqft is num) lotInAcres = sqft / 43560.0;
-        return lotInAcres == null ? true : lotInAcres >= _lotAcresMin!;
-      }).toList();
-      if (_hoaMax != null) mapped = mapped.where((l) {
-        final hoa = l['hoa'] ?? l['hoaFee'] ?? l['associationFee'];
-        final n = (hoa is num) ? hoa.toInt() : int.tryParse('$hoa');
-        return n == null ? true : n <= _hoaMax!;
-      }).toList();
-      if (_hasOpenHouse == true) mapped = mapped.where((l) {
-        final oh = l['openHouse'] ?? l['open_houses'] ?? l['openHouseSchedule'];
-        if (oh is List && oh.isNotEmpty) return true;
-        return _t(l).contains('open house');
-      }).toList();
-
-      _applyClientSorting(mapped);
-
-      setState(() {
-        if (reset) {
-          _listings = mapped;
-          _cache[key] = mapped;
-        } else {
-          _listings.addAll(mapped);
-        }
-        _selectedOnMap = null;
-        _mapDirty = false;
-      });
-    } catch (e) {
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Error loading listings: $e')),
-      );
-    } finally {
-      if (mounted) {
-        setState(() {
-          _loading = false;
-          _loadingMore = false;
-        });
-      }
-    }
-  }
-
-  void _applyClientSorting(List<Map<String, dynamic>> list) {
-    int numOrMax(num? n) => (n == null) ? 1 << 30 : n.toInt();
-    switch (_sortMode) {
-      case _SortMode.newest:
-        list.sort((a, b) {
-          final sa = '${a['list_date'] ?? a['listDate'] ?? ''}';
-          final sb = '${b['list_date'] ?? b['listDate'] ?? ''}';
-          return sb.compareTo(sa);
-        });
-        break;
-      case _SortMode.priceLow:
-        list.sort((a, b) => (numOrMax(_num(a['price'])) - numOrMax(_num(b['price']))));
-        break;
-      case _SortMode.priceHigh:
-        list.sort((a, b) => (numOrMax(_num(b['price'])) - numOrMax(_num(a['price']))));
-        break;
-      case _SortMode.beds:
-        list.sort((a, b) => (numOrMax(_bedsValue(b)) - numOrMax(_bedsValue(a))));
-        break;
-      case _SortMode.sqft:
-        list.sort((a, b) => (numOrMax(_num(b['sqft'])) - numOrMax(_num(a['sqft']))));
-        break;
-      case _SortMode.dom:
-        list.sort((a, b) => (numOrMax(_num(a['dom'] ?? a['daysOnMarket'])) -
-            numOrMax(_num(b['dom'] ?? b['daysOnMarket']))));
-        break;
-    }
-  }
-
-  String _tileKey(double lat, double lng, double radius) {
-    final rLat = (lat * 100).roundToDouble() / 100.0;
-    final rLng = (lng * 100).roundToDouble() / 100.0;
-    return 'LAT:$rLat|LNG:$rLng|R:$radius|O:$_offset';
-  }
-
-  double _radiusFromZoom(double zoom) {
-    final clamp = zoom.clamp(3, 16);
-    final miles = pow(2, (13 - clamp)) * 3.0;
-    return miles.toDouble().clamp(1.0, 200.0);
-  }
-
-  void _openDetails(Map<String, dynamic> listing) {
-    Navigator.pushNamed(context, '/listing-details', arguments: {'listing': listing});
-  }
-
-  // ---------------- UI ----------------
   @override
   Widget build(BuildContext context) {
-    final hasData = _listings.isNotEmpty;
-
     return Scaffold(
-      appBar: AppBar(
-        title: GestureDetector(
-          onLongPress: _copyRawSample,
-          child: const Text('Search Results'),
+      appBar: AppBar(title: const Text('Virtual Tour')),
+      body: WebViewWidget(controller: _controller),
+    );
+  }
+}
+
+
+class SearchResultsScreen extends StatefulWidget {
+    const SearchResultsScreen({Key? key}) : super(key: key);
+
+    @override
+    _SearchResultsScreenState createState() => _SearchResultsScreenState();
+  }
+
+class _SearchResultsScreenState extends State<SearchResultsScreen> {
+  void _toggleVisited(Map<String, dynamic> listing) {
+    // Implement visited logic (e.g., update Firestore or local state)
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('Visited status updated!')),
+    );
+  }
+  void _toggleLike(Map<String, dynamic> listing) {
+    // Implement like logic (e.g., update Firestore or local state)
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('Like status updated!')),
+    );
+  }
+  String _formatTimestamp(dynamic ts) {
+    if (ts == null) return '';
+    DateTime? dt;
+    if (ts is DateTime) {
+      dt = ts;
+    } else if (ts is Timestamp) {
+      dt = ts.toDate();
+    } else if (ts is int) {
+      dt = DateTime.fromMillisecondsSinceEpoch(ts);
+    } else if (ts is String) {
+      dt = DateTime.tryParse(ts);
+    }
+    if (dt == null) return ts.toString();
+    final now = DateTime.now();
+    final diff = now.difference(dt);
+    if (diff.inDays > 0) {
+      return '${dt.month}/${dt.day}/${dt.year}';
+    } else if (diff.inHours > 0) {
+      return '${diff.inHours}h ago';
+    } else if (diff.inMinutes > 0) {
+      return '${diff.inMinutes}m ago';
+    } else {
+      return 'just now';
+    }
+  }
+  final _fs = FirebaseFirestore.instance;
+  final _auth = FirebaseAuth.instance;
+
+  Map<String, int> _commentCounts = {};
+  Map<String, List<Map<String, dynamic>>> _commentsCache = {};
+  final _commentController = TextEditingController();
+  final _api = RealtorApiService();
+  List<Map<String, dynamic>> _listings = [];
+  bool _loading = false;
+  String? _lastError;
+  bool _isFeedMode = true;
+  Map<String, dynamic>? _lastArgs;
+
+  Future<int> _fetchCommentCount(Map<String, dynamic> listing) async {
+    final id = listing['id'] ?? listing['property_id'] ?? listing['listing_id'] ?? listing['mlsId'] ?? listing['zpid'];
+    if (id == null) return 0;
+    final snap = await _fs.collection('listings').doc(id.toString()).collection('comments').count().get();
+    return snap.count ?? 0;
+  }
+
+  Future<List<Map<String, dynamic>>> _fetchComments(Map<String, dynamic> listing) async {
+    final id = listing['id'] ?? listing['property_id'] ?? listing['listing_id'] ?? listing['mlsId'] ?? listing['zpid'];
+    if (id == null) return [];
+    final snap = await _fs.collection('listings').doc(id.toString()).collection('comments').orderBy('createdAt', descending: true).limit(30).get();
+    return snap.docs.map((d) => d.data()).toList();
+  }
+
+  Future<void> _showCommentsDialog(Map<String, dynamic> listing) async {
+    final id = listing['id'] ?? listing['property_id'] ?? listing['listing_id'] ?? listing['mlsId'] ?? listing['zpid'];
+    if (id == null) return;
+    List<Map<String, dynamic>> comments = [];
+    await showDialog(
+      context: context,
+      barrierDismissible: true,
+      builder: (ctx) {
+        return StatefulBuilder(
+          builder: (ctx, setStateDialog) {
+            return AlertDialog(
+              title: const Text('Comments'),
+              content: SizedBox(
+                width: 350,
+                child: FutureBuilder<List<Map<String, dynamic>>>(
+                  future: _fetchComments(listing),
+                  builder: (context, snapshot) {
+                    if (snapshot.connectionState == ConnectionState.waiting) {
+                      return const Center(child: CircularProgressIndicator());
+                    }
+                    comments = snapshot.data ?? [];
+                    if (comments.isEmpty) {
+                      return const Text('No comments yet.');
+                    }
+                    return SizedBox(
+                      height: 250,
+                      child: ListView.builder(
+                        itemCount: comments.length,
+                        itemBuilder: (context, i) {
+                          final c = comments[i];
+                          return ListTile(
+                            leading: const Icon(Icons.person, size: 24),
+                            title: Text(c['displayName'] ?? 'User'),
+                            subtitle: Text(c['text'] ?? ''),
+                            trailing: c['createdAt'] != null ? Text(_formatTimestamp(c['createdAt'])) : null,
+                          );
+                        },
+                      ),
+                    );
+                  },
+                ),
+              ),
+              actions: [
+                TextField(
+                  controller: _commentController,
+                  decoration: const InputDecoration(hintText: 'Write a comment...'),
+                  maxLines: 2,
+                ),
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.end,
+                  children: [
+                    TextButton(
+                      onPressed: () => Navigator.pop(ctx),
+                      child: const Text('Close'),
+                    ),
+                    ElevatedButton(
+                      onPressed: () async {
+                        await _addComment(listing);
+                        setStateDialog(() {});
+                      },
+                      child: const Text('Post'),
+                    ),
+                  ],
+                ),
+              ],
+            );
+          },
+        );
+      },
+    );
+  }
+
+
+  Future<void> _addComment(Map<String, dynamic> listing) async {
+    final u = _auth.currentUser;
+    if (u == null) return;
+    final id = listing['id'] ?? listing['property_id'] ?? listing['listing_id'] ?? listing['mlsId'] ?? listing['zpid'];
+    if (id == null) return;
+    final txt = _commentController.text.trim();
+    if (txt.isEmpty) return;
+    await _fs.collection('listings').doc(id.toString()).collection('comments').add({
+      'uid': u.uid,
+      'displayName': u.displayName ?? 'User',
+      'text': txt,
+      'createdAt': FieldValue.serverTimestamp(),
+    });
+    _commentController.clear();
+    ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Comment added!')));
+  }
+
+  Future<void> _showCommentDialog(Map<String, dynamic> listing) async {
+    _commentController.clear();
+    await showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Add Comment'),
+        content: TextField(
+          controller: _commentController,
+          decoration: const InputDecoration(hintText: 'Write your comment...'),
+          maxLines: 3,
         ),
         actions: [
-          if (!_loading && hasData)
-            IconButton(
-              icon: Icon(_mapView ? Icons.list : Icons.map),
-              onPressed: () => setState(() {
-                _mapView = !_mapView;
-                _selectedOnMap = null;
-              }),
-              tooltip: _mapView ? 'Show List' : 'Show Map',
-            ),
-          PopupMenuButton<_SortMode>(
-            tooltip: 'Sort',
-            onSelected: (m) {
-              setState(() => _sortMode = m);
-              final cp = [..._listings];
-              _applyClientSorting(cp);
-              setState(() => _listings = cp);
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('Cancel'),
+          ),
+          ElevatedButton(
+            onPressed: () async {
+              await _addComment(listing);
+              Navigator.pop(ctx);
             },
-            itemBuilder: (_) => const [
-              PopupMenuItem(value: _SortMode.newest,    child: Text('Newest')),
-              PopupMenuItem(value: _SortMode.priceLow,  child: Text('Price: Low to High')),
-              PopupMenuItem(value: _SortMode.priceHigh, child: Text('Price: High to Low')),
-              PopupMenuItem(value: _SortMode.beds,      child: Text('Beds')),
-              PopupMenuItem(value: _SortMode.sqft,      child: Text('Square Feet')),
-              PopupMenuItem(value: _SortMode.dom,       child: Text('Days on Market')),
-            ],
-            icon: const Icon(Icons.sort),
+            child: const Text('Post'),
           ),
         ],
       ),
-      body: _loading
-          ? _buildSkeletonList()
-          : (!hasData
-              ? const Center(child: Text('No results. Try widening your search.'))
-              : Column(
-                  children: [
-                    _FiltersBar(
-                      city: _city,
-                      state: _state,
-                      zip: _zip,
-                      radiusMiles: _radiusMiles,
-                      beds: _bedsFilter,
-                      baths: _bathsFilter,
-                      minPrice: _minPrice,
-                      maxPrice: _maxPrice,
-                      minSqft: _minSqft,
-                      typeCode: _propertyType,
-                      garage: _hasGarage == true,
-                      pool: _pool == true,
-                      pets: _pets == true,
-                      waterfront: _waterfront == true,
-                      views: _views == true,
-                      basement: _basement == true,
-                      domMax: _domMax,
-                      yearBuiltMin: _yearBuiltMin,
-                      lotAcresMin: _lotAcresMin,
-                      hoaMax: _hoaMax,
-                      openHouse: _hasOpenHouse == true,
-                    ),
-                    const Divider(height: 1),
-                    Expanded(child: _mapView ? _buildMap() : _buildList()),
-                  ],
-                )),
     );
   }
 
-  // ---------- List view ----------
-  Widget _buildList() {
-    return RefreshIndicator(
-      onRefresh: () => _fetch(reset: true),
-      child: NotificationListener<ScrollNotification>(
-        onNotification: (n) {
-          if (!_loadingMore &&
-              n.metrics.pixels >= n.metrics.maxScrollExtent - 200) {
-            setState(() => _loadingMore = true);
-            _offset += _pageSize;
-            _fetch(); // don't await in onNotification
+  void _shareListing(Map<String, dynamic> listing) {
+    final addr = _ListingCard._composeAddress(listing);
+    final price = listing['price'] != null ? ' 24${listing['price']}' : '';
+    String url = '';
+    final photos = (listing['photos'] as List?)?.cast<String>() ?? [];
+    if (photos.isNotEmpty) {
+      final hiRes = _hiResCandidates(photos.first);
+      if (hiRes.isNotEmpty) url = hiRes.first;
+    }
+    final text = 'Check out this listing: $addr $price $url';
+    Share.share(text);
+  }
+
+    @override
+    void didChangeDependencies() {
+      super.didChangeDependencies();
+      final args = ModalRoute.of(context)?.settings.arguments;
+      if (args is Map<String, dynamic>) {
+        if (_lastArgs == null || !_mapEquals(_lastArgs!, args)) {
+          _lastArgs = Map<String, dynamic>.from(args);
+          _fetchWithArgs(args);
+        }
+      } else if (_lastArgs == null) {
+        // No args, only fetch once
+        _lastArgs = {};
+        _fetchWithArgs({});
+      }
+
+      // Precache first image for smoother UX
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted) return;
+        if (_listings.isNotEmpty && (_listings.first['photos'] is List) && (_listings.first['photos'] as List).isNotEmpty) {
+          final firstUrl = (_listings.first['photos'] as List).first;
+          final normalized = pickBestPhotoUrl([firstUrl]);
+          if (normalized != null) {
+            precacheImage(CachedNetworkImageProvider(normalized), context);
           }
-          return false; // allow the notification to continue bubbling
-        },
-        child: ListView.builder(
-          padding: const EdgeInsets.all(12),
-          itemCount: _listings.length + 1,
-          itemBuilder: (context, i) {
-            if (i == _listings.length) {
-              return Padding(
-                padding: const EdgeInsets.symmetric(vertical: 16),
-                child: _loadingMore
-                    ? const Center(child: CircularProgressIndicator())
-                    : const SizedBox.shrink(),
-              );
+        }
+      });
+    }
+
+    bool _mapEquals(Map a, Map b) {
+      if (a.length != b.length) return false;
+      for (final k in a.keys) {
+        if (!b.containsKey(k) || a[k] != b[k]) return false;
+      }
+      return true;
+    }
+
+    Future<void> _fetchWithArgs(Map<String, dynamic> args) async {
+      setState(() {
+        _loading = true;
+        _lastError = null;
+      });
+
+      try {
+        if (dotenv.env.isEmpty) {
+          await dotenv.load();
+        }
+
+        final city = (args['city'] as String?)?.trim();
+        final state = (args['state'] as String?)?.trim();
+        final zip = (args['zip'] as String?)?.trim();
+
+        final raw = await _api.searchBuy(
+          city: city,
+          state: state,
+          zipcode: zip,
+          resultsPerPage: 20,
+          page: 1,
+        );
+
+        final data = raw['data'];
+        final List<Map<String, dynamic>> results =
+            (data?['results'] as List? ?? const [])
+                .whereType<Map>()
+                .map((e) => e.cast<String, dynamic>())
+                .toList();
+
+        // Compose photo and virtual tours for each result
+        for (final l in results) {
+          final List<String> photos = [];
+          if (l['primary_photo'] is Map && l['primary_photo']['href'] is String) {
+            photos.add(l['primary_photo']['href']);
+          }
+          if (l['photos'] is List) {
+            for (final p in l['photos']) {
+              if (p is String) photos.add(p);
+              if (p is Map && p['href'] is String) photos.add(p['href']);
+              if (p is Map && p['url'] is String) photos.add(p['url']);
             }
-            final l = _listings[i];
-            final id = _deriveListingId(l);
-            return _ListingCard(
-              data: l,
-              saved: _favIDs.contains(id),
-              onTap: () => _openDetails(l),
-              onSaveToggle: () => _toggleFavoriteFromList(l),
-              onHide: () {
-                setState(() => _listings.removeAt(i));
-                ScaffoldMessenger.of(context).showSnackBar(
-                  SnackBar(
-                    content: const Text('Listing hidden'),
-                    action: SnackBarAction(
-                      label: 'Undo',
-                      onPressed: () => setState(() => _listings.insert(i, l)),
-                    ),
-                  ),
-                );
-              },
-              onShare: () async {
-                final addr = _composeAddress(l);
-                await Clipboard.setData(ClipboardData(text: addr));
-                if (!mounted) return;
-                ScaffoldMessenger.of(context).showSnackBar(
-                  const SnackBar(content: Text('Address copied. Paste to share.')),
-                );
-              },
-              onOpenMaps: () => _openInMaps(_composeAddress(l)),
-            );
-          },
-        ),
-      ),
-    );
-  }
+          }
+          l['photos'] = photos;
+          l['virtual_tours'] = _extractVirtualTours(l);
+        }
 
-  // ---------- Map view ----------
-  Widget _buildMap() {
-    final first = _listings.firstWhere(
-      (l) => (l['lat'] ?? l['coordinates']?['latitude']) != null &&
-             (l['lon'] ?? l['coordinates']?['longitude']) != null,
-      orElse: () => <String, dynamic>{},
-    );
-    final double centerLat =
-        (first['lat'] ?? first['coordinates']?['latitude'] ?? 39.0).toDouble();
-    final double centerLon =
-        (first['lon'] ?? first['coordinates']?['longitude'] ?? -77.0).toDouble();
+        // Ensure virtual tours load first in feed
+        results.sort((a, b) {
+          final av = (a['virtual_tours'] as List?)?.isNotEmpty ?? false;
+          final bv = (b['virtual_tours'] as List?)?.isNotEmpty ?? false;
+          return (bv ? 1 : 0) - (av ? 1 : 0);
+        });
 
-    final zoomForCluster = _lastZoom ?? 11;
+        debugPrint('🔎 Results=${results.length}');
+        setState(() {
+          _listings = results;
+        });
+      } catch (e) {
+        setState(() {
+          _lastError = e.toString();
+        });
+      } finally {
+        setState(() {
+          _loading = false;
+        });
+      }
+    }
 
-    final markers = _buildClusterMarkers(
-      _listings,
-      zoom: zoomForCluster,
-      onTapListing: (l) => setState(() => _selectedOnMap = l),
-      onTapCluster: (lat, lon) {
-        final next = ((_lastZoom ?? 11) + 1).clamp(4, 18.0).toDouble();
-        _mapController.move(LatLng(lat, lon), next);
-      },
-    );
+    num? _num(dynamic v) {
+      if (v == null) return null;
+      if (v is num) return v;
+      return num.tryParse(v.toString());
+    }
 
-    return Stack(
-      children: [
-        FlutterMap(
-          mapController: _mapController,
-          options: MapOptions(
-            initialCenter: LatLng(centerLat, centerLon),
-            initialZoom: 11,
-            onMapReady: () {
-              _isMapReady = true;
-              _lastZoom ??= 11;
-            },
-            onMapEvent: (evt) {
-              _lastZoom = evt.camera.zoom;
-              if (!_mapDirty) setState(() => _mapDirty = true);
-              _selectedOnMap = null;
-            },
-          ),
-          children: [
-            TileLayer(
-              urlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
-              userAgentPackageName: 'com.hommie.app',
+    @override
+    Widget build(BuildContext context) {
+      return Scaffold(
+        appBar: AppBar(
+          title: const Text('Search Results'),
+          actions: [
+            IconButton(
+              icon: Icon(_isFeedMode ? Icons.view_list : Icons.view_carousel),
+              tooltip: _isFeedMode ? 'Switch to List View' : 'Switch to Feed View',
+              onPressed: () => setState(() => _isFeedMode = !_isFeedMode),
             ),
-            MarkerLayer(markers: markers),
           ],
         ),
+        body: _loading
+            ? const Center(child: CircularProgressIndicator())
+        : _lastError != null
+          ? Center(child: Text('Error:\n${_lastError!}'))
+          : _isFeedMode
+            ? _buildFeedView()
+            : _buildListView(),
+      );
+    }
 
-        if (_mapDirty)
-          Positioned(
-            top: 16,
-            left: 0,
-            right: 0,
-            child: Center(
-              child: ElevatedButton.icon(
-                icon: const Icon(Icons.refresh),
-                label: const Text('Search this area'),
-                onPressed: () {
-                  if (!_isMapReady) return;
-                  final c = _mapController.camera.center;
-                  final z = _mapController.camera.zoom;
-                  final r = _radiusFromZoom(z);
-                  setState(() {
-                    _radiusMiles = r;
-                    _offset = 0;
-                  });
-                  _fetch(reset: true, centerLat: c.latitude, centerLng: c.longitude);
-                },
-              ),
-            ),
-          ),
-
-        Positioned(
-          right: 12,
-          bottom: 24,
-          child: Column(
-            children: [
-              _ZoomBtn(
-                icon: Icons.add,
+    // Feed mode: Fullscreen, swipeable listings with photo carousel and actions
+    Widget _buildFeedView() {
+      if (_listings.isEmpty) {
+        return const Center(child: Text('No listings found.'));
+      }
+      // Feed view: paged, full-screen, one listing per page (like Instagram/Tinder)
+      return PageView.builder(
+        scrollDirection: Axis.vertical,
+        itemCount: _listings.length,
+        itemBuilder: (context, index) {
+          final l = _listings[index];
+            // Virtual tours as default landing if available
+            final validTours = _extractVirtualTours(l);
+            final photos = (l['photos'] as List?)?.cast<String>() ?? [];
+            final filteredPhotos = photos.where((p) => !p.trim().endsWith('�241') && !p.trim().endsWith('�241?dpr=2') && !p.trim().endsWith('�241/')).toList();
+            final hiResPhotos = filteredPhotos.expand(_hiResCandidates).where((u) => !u.contains('�241')).toList();
+            assert(() {
+              if (kDebugMode && hiResPhotos.isNotEmpty) {
+                logImageUrlIssues(hiResPhotos.first);
+              }
+              return true;
+            }());
+            return SizedBox.expand(
+              child: GestureDetector(
                 onTap: () {
-                  if (!_isMapReady) return;
-                  final c = _mapController.camera.center;
-                  final next = _mapController.camera.zoom + 1;
-                  _mapController.move(c, next);
+                  Navigator.of(context).pushNamed(
+                    '/listing-details',
+                    arguments: {'listing': l},
+                  );
                 },
-              ),
-              const SizedBox(height: 8),
-              _ZoomBtn(
-                icon: Icons.remove,
-                onTap: () {
-                  if (!_isMapReady) return;
-                  final c = _mapController.camera.center;
-                  final next = _mapController.camera.zoom - 1;
-                  _mapController.move(c, next);
-                },
-              ),
-            ],
-          ),
-        ),
-
-        if (_selectedOnMap != null)
-          Positioned(
-            left: 12,
-            right: 12,
-            bottom: 110,
-            child: _MiniPreviewCard(
-              data: _selectedOnMap!,
-              onOpen: () => _openDetails(_selectedOnMap!),
-            ),
-          ),
-
-        DraggableScrollableSheet(
-          minChildSize: 0.10,
-          initialChildSize: 0.10,
-          maxChildSize: 0.85,
-          builder: (context, controller) {
-            return Container(
-              decoration: BoxDecoration(
-                color: Theme.of(context).colorScheme.surface,
-                borderRadius: const BorderRadius.vertical(top: Radius.circular(18)),
-                boxShadow: const [BoxShadow(blurRadius: 8, color: Colors.black26)],
-              ),
-              child: Column(
-                children: [
-                  const SizedBox(height: 8),
-                  Container(
-                    width: 36, height: 4,
-                    decoration: BoxDecoration(
-                      color: Colors.black26, borderRadius: BorderRadius.circular(999),
-                    ),
+                child: Card(
+                  margin: EdgeInsets.zero,
+                  elevation: 4,
+                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(0)),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      // Show virtual tour if available, else photo carousel
+                      Expanded(
+                        child: validTours.isNotEmpty
+                            ? ClipRRect(
+                                borderRadius: BorderRadius.circular(8),
+                                child: SizedBox.expand(
+                                  child: InAppTourWebView(url: validTours.first),
+                                ),
+                              )
+                            : ListingImage(
+                                photos: hiResPhotos,
+                                priceLabel: formatListingPrice(l['price'], fallback: l['formattedPrice']),
+                                fullScreen: true,
+                              ),
+                      ),
+                      Padding(
+                        padding: const EdgeInsets.all(16),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(_ListingCard._composeAddress(l), style: const TextStyle(color: Colors.black, fontSize: 20, fontWeight: FontWeight.bold)),
+                            const SizedBox(height: 8),
+                            Row(
+                              children: [
+                                IconButton(
+                                  icon: const Icon(Icons.favorite_border, color: Colors.red),
+                                  onPressed: () => _toggleLike(l),
+                                ),
+                                Stack(
+                                  alignment: Alignment.topRight,
+                                  children: [
+                                    IconButton(
+                                      icon: const Icon(Icons.comment, color: Colors.blue),
+                                      onPressed: () => _showCommentsDialog(l),
+                                    ),
+                                    FutureBuilder<int>(
+                                      future: _fetchCommentCount(l),
+                                      builder: (context, snapshot) {
+                                        final count = snapshot.data ?? 0;
+                                        if (count == 0) return const SizedBox.shrink();
+                                        return Container(
+                                          padding: const EdgeInsets.all(2),
+                                          decoration: BoxDecoration(
+                                            color: Colors.blue,
+                                            borderRadius: BorderRadius.circular(10),
+                                          ),
+                                          constraints: const BoxConstraints(minWidth: 18, minHeight: 18),
+                                          child: Text(
+                                            '$count',
+                                            style: const TextStyle(color: Colors.white, fontSize: 12, fontWeight: FontWeight.bold),
+                                            textAlign: TextAlign.center,
+                                          ),
+                                        );
+                                      },
+                                    ),
+                                  ],
+                                ),
+                                IconButton(
+                                  icon: const Icon(Icons.check_circle_outline, color: Colors.green),
+                                  onPressed: () => _toggleVisited(l),
+                                ),
+                                IconButton(
+                                  icon: const Icon(Icons.ios_share, color: Colors.black),
+                                  onPressed: () => _shareListing(l),
+                                ),
+                              ],
+                            ),
+                          ],
+                        ),
+                      ),
+                    ],
                   ),
-                  const SizedBox(height: 8),
+                ),
+              ),
+            );
+        },
+      );
+    }
+
+    // List mode: Scrollable list of cards
+    Widget _buildListView() {
+      if (_listings.isEmpty) {
+        return const Center(child: Text('No listings found.'));
+      }
+      return ListView.separated(
+        padding: const EdgeInsets.all(12),
+        itemCount: _listings.length,
+        separatorBuilder: (_, __) => const SizedBox(height: 12),
+        itemBuilder: (context, index) {
+          final l = _listings[index];
+          final photos = (l['photos'] as List?)?.cast<String>() ?? [];
+          final filteredPhotos = photos.where((p) => !p.trim().endsWith('�241') && !p.trim().endsWith('�241?dpr=2') && !p.trim().endsWith('�241/')).toList();
+          final hiResPhotos = filteredPhotos.expand(_hiResCandidates).where((u) => !u.contains('�241')).toList();
+          assert(() {
+            if (kDebugMode && hiResPhotos.isNotEmpty) {
+              logImageUrlIssues(hiResPhotos.first);
+            }
+            return true;
+          }());
+          return GestureDetector(
+            onTap: () {
+              Navigator.of(context).pushNamed(
+                '/listing-details',
+                arguments: {'listing': l},
+              );
+            },
+            child: Card(
+              child: Row(
+                children: [
+                  if (hiResPhotos.isNotEmpty)
+                    ClipRRect(
+                      borderRadius: const BorderRadius.horizontal(left: Radius.circular(8)),
+                      child: SizedBox(
+                        width: 72,
+                        height: 72,
+                        child: ListingImage(
+                          photos: hiResPhotos,
+                          priceLabel: formatListingPrice(l['price'], fallback: l['formattedPrice']),
+                          fullScreen: false,
+                        ),
+                      ),
+                    )
+                  else
+                    Container(
+                      width: 72,
+                      height: 72,
+                      color: Colors.grey.shade200,
+                      alignment: Alignment.center,
+                      child: const Icon(Icons.home_outlined, size: 40),
+                    ),
                   Expanded(
-                    child: ListView.builder(
-                      controller: controller,
-                      padding: const EdgeInsets.fromLTRB(12, 0, 12, 12),
-                      itemCount: _listings.length,
-                      itemBuilder: (_, i) {
-                        final l = _listings[i];
-                        final id = _deriveListingId(l);
-                        return Padding(
-                          padding: const EdgeInsets.only(bottom: 12),
-                          child: _ListingCard(
-                            data: l,
-                            saved: _favIDs.contains(id),
-                            onTap: () => _openDetails(l),
-                            onSaveToggle: () => _toggleFavoriteFromList(l),
-                            onHide: () {
-                              setState(() => _listings.removeAt(i));
-                            },
-                            onShare: () async {
-                              final addr = _composeAddress(l);
-                              await Clipboard.setData(ClipboardData(text: addr));
-                              if (!mounted) return;
-                              ScaffoldMessenger.of(context).showSnackBar(
-                                const SnackBar(content: Text('Address copied.')),
-                              );
-                            },
-                            onOpenMaps: () => _openInMaps(_composeAddress(l)),
-                          ),
-                        );
-                      },
+                    child: ListTile(
+                      contentPadding: const EdgeInsets.symmetric(horizontal: 8, vertical: 0),
+                      title: Text(_ListingCard._composeAddress(l)),
+                      subtitle: Text(formatListingPrice(l['price'], fallback: l['formattedPrice'])),
+                      trailing: const Icon(Icons.chevron_right),
                     ),
                   ),
                 ],
               ),
-            );
-          },
-        ),
-      ],
-    );
-  }
-
-  // ---------- helpers ----------
-  String _composeAddress(Map<String, dynamic> l) {
-    final line  = _addrLine(l);
-    final city  = _addrCity(l) ?? '';
-    final state = _addrState(l) ?? '';
-    if (line == null || line.trim().isEmpty) {
-      final fallback = (l['formattedAddress'] ?? '').toString();
-      if (fallback.isNotEmpty) return fallback;
-      return (city.isEmpty && state.isEmpty) ? 'Address unavailable' : '$city, $state';
-    }
-    return '$line, $city, $state';
-  }
-
-  Future<void> _openInMaps(String address) async {
-    final encoded = Uri.encodeComponent(address);
-    final apple = Uri.parse('http://maps.apple.com/?q=$encoded');
-    final google = Uri.parse('https://www.google.com/maps/search/?api=1&query=$encoded');
-    if (await canLaunchUrl(apple)) {
-      await launchUrl(apple, mode: LaunchMode.externalApplication);
-    } else {
-      await launchUrl(google, mode: LaunchMode.externalApplication);
-    }
-  }
-
-  String? _addrLine(Map<String, dynamic> l) {
-    final a = l['address'];
-    if (a is Map) {
-      return a['line'] ?? a['street'] ?? l['addressLine1'] ?? l['streetAddress'] ?? l['formattedAddress'];
-    }
-    return l['addressLine1'] ?? l['streetAddress'] ?? l['formattedAddress'];
-  }
-
-  String? _addrCity(Map<String, dynamic> l) {
-    final a = l['address'];
-    return (a is Map ? a['city'] : null) ?? l['city'];
-  }
-
-  String? _addrState(Map<String, dynamic> l) {
-    final a = l['address'];
-    return (a is Map ? (a['state'] ?? a['stateCode']) : null) ?? l['state'] ?? l['stateCode'];
-  }
-
-  num? _bedsValue(Map<String, dynamic> l) {
-    return _num(l['beds']) ??
-        _num(l['bedrooms']) ??
-        _num(l['numBedrooms']) ??
-        _num(l['bed']) ??
-        _num(l['beds_min']) ??
-        _num(l['beds_max']);
-  }
-
-  num? _bathsValue(Map<String, dynamic> l) {
-    final tot = _num(l['baths']) ??
-        _num(l['bathrooms']) ??
-        _num(l['bathroomsTotal']) ??
-        _num(l['bathroomsTotalInteger']) ??
-        _num(l['baths_full_calc']);
-    if (tot != null) return tot;
-
-    final full = _num(l['fullBathrooms']) ?? _num(l['bathsFull']) ?? _num(l['bathrooms_full']) ?? 0;
-    final half = _num(l['halfBathrooms']) ?? _num(l['bathsHalf']) ?? _num(l['bathrooms_half']) ?? 0;
-    if ((full ?? 0) != 0 || (half ?? 0) != 0) return (full ?? 0) + (half ?? 0) * 0.5;
-    return null;
-  }
-
-  num? _num(dynamic v) {
-    if (v == null) return null;
-    if (v is num) return v;
-    return num.tryParse(v.toString());
-  }
-
-  // ---- clustering (no extra package) ----
-  List<Marker> _buildClusterMarkers(
-    List<Map<String, dynamic>> items, {
-    required double zoom,
-    required Function(Map<String, dynamic>) onTapListing,
-    required Function(double, double) onTapCluster,
-  }) {
-    const cell = 60.0; // pixels
-    final scale = 256 * pow(2, zoom);
-    double _x(num lon) => ((lon + 180) / 360) * scale;
-    double _y(num lat) {
-      final r = pi / 180;
-      final s = sin(lat * r);
-      return (0.5 - log((1 + s) / (1 - s)) / (4 * pi)) * scale;
+            ),
+          );
+        },
+      );
     }
 
-    final buckets = <String, List<Map<String, dynamic>>>{};
-    for (final it in items) {
-      final lat = _num(it['lat']) ?? _num(it['coordinates']?['latitude']);
-      final lon = _num(it['lon']) ?? _num(it['lng']) ?? _num(it['longitude']) ?? _num(it['coordinates']?['longitude']);
-      if (lat == null || lon == null) continue;
-      final px = _x(lon);
-      final py = _y(lat);
-      final key = '${(px / cell).floor()}|${(py / cell).floor()}';
-      (buckets[key] ??= []).add(it);
+    String? _addrCity(Map<String, dynamic> l) {
+      final a = l['address'];
+      return (a is Map ? a['city'] : null) ?? l['city'];
     }
 
-    final markers = <Marker>[];
-    buckets.forEach((_, group) {
-      double lat = 0, lon = 0;
-      for (final it in group) {
-        lat += (_num(it['lat']) ?? _num(it['coordinates']?['latitude']))!.toDouble();
-        lon += (_num(it['lon']) ?? _num(it['lng']) ?? _num(it['longitude']) ?? _num(it['coordinates']?['longitude']))!.toDouble();
-      }
-      lat /= group.length; lon /= group.length;
+    String? _addrState(Map<String, dynamic> l) {
+      final a = l['address'];
+      return (a is Map ? (a['state'] ?? a['stateCode']) : null) ?? l['state'] ?? l['stateCode'];
+    }
 
-      if (group.length == 1) {
-        final l = group.first;
-        final price = _num(l['price']) ?? 0;
-        markers.add(
-          Marker(
-            width: 96, height: 36, point: LatLng(lat, lon),
-            child: GestureDetector(
-              onTap: () => onTapListing(l),
-              child: Container(
-                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
-                decoration: BoxDecoration(
-                  color: Theme.of(context).colorScheme.primary,
-                  borderRadius: BorderRadius.circular(18),
-                  boxShadow: const [BoxShadow(color: Colors.black26, blurRadius: 4)],
-                ),
-                child: Text(
-                  '\$${_short(price)}',
-                  style: TextStyle(
-                    color: Theme.of(context).colorScheme.onPrimary,
-                    fontWeight: FontWeight.w600,
+    num? _bedsValue(Map<String, dynamic> l) {
+      return _num(l['beds']) ??
+          _num(l['bedrooms']) ??
+          _num(l['numBedrooms']) ??
+          _num(l['bed']) ??
+          _num(l['beds_min']) ??
+          _num(l['beds_max']);
+    }
+
+    // ---------- skeletons ----------
+    Widget _buildSkeletonList() {
+      return ListView.separated(
+        padding: const EdgeInsets.all(12),
+        itemCount: 6,
+        separatorBuilder: (_, __) => const SizedBox(height: 12),
+        itemBuilder: (_, __) {
+          return Container(
+            decoration: BoxDecoration(
+              color: Colors.white,
+              borderRadius: BorderRadius.circular(16),
+              border: Border.all(color: Colors.black12),
+            ),
+            child: Column(
+              children: [
+                Container(
+                  height: 180,
+                  decoration: BoxDecoration(
+                    color: Colors.grey.shade200,
+                    borderRadius: const BorderRadius.vertical(top: Radius.circular(16)),
                   ),
                 ),
-              ),
-            ),
-          ),
-        );
-      } else {
-        markers.add(
-          Marker(
-            width: 44, height: 44, point: LatLng(lat, lon),
-            child: GestureDetector(
-              onTap: () => onTapCluster(lat, lon),
-              child: Container(
-                alignment: Alignment.center,
-                decoration: BoxDecoration(
-                  color: Theme.of(context).colorScheme.primary,
-                  shape: BoxShape.circle,
-                  boxShadow: const [BoxShadow(color: Colors.black26, blurRadius: 4)],
-                ),
-                child: Text(
-                  '${group.length}',
-                  style: TextStyle(
-                    color: Theme.of(context).colorScheme.onPrimary,
-                    fontWeight: FontWeight.w700,
+                Padding(
+                  padding: const EdgeInsets.all(12),
+                  child: Column(
+                    children: [
+                      Container(height: 18, width: 120, color: Colors.grey.shade200),
+                      const SizedBox(height: 10),
+                      Container(height: 14, width: double.infinity, color: Colors.grey.shade200),
+                      const SizedBox(height: 6),
+                      Row(
+                        children: [
+                          Expanded(child: Container(height: 28, color: Colors.grey.shade200)),
+                          const SizedBox(width: 8),
+                          Expanded(child: Container(height: 28, color: Colors.grey.shade200)),
+                          const SizedBox(width: 8),
+                          Expanded(child: Container(height: 28, color: Colors.grey.shade200)),
+                        ],
+                      ),
+                    ],
                   ),
                 ),
-              ),
+              ],
             ),
-          ),
-        );
-      }
-    });
+          );
+        },
+      );
+    }
+  // ...existing code...
+  } // <-- Correct closing brace for _SearchResultsScreenState
 
-    return markers;
-  }
+/* ===========================
+   IMAGE HELPERS (TOP-LEVEL)
+   =========================== */
 
-  // ---------- skeletons ----------
-  Widget _buildSkeletonList() {
-    return ListView.separated(
-      padding: const EdgeInsets.all(12),
-      itemCount: 6,
-      separatorBuilder: (_, __) => const SizedBox(height: 12),
-      itemBuilder: (_, __) {
-        return Container(
-          decoration: BoxDecoration(
-            color: Colors.white,
-            borderRadius: BorderRadius.circular(16),
-            border: Border.all(color: Colors.black12),
-          ),
-          child: Column(
-            children: [
-              Container(
-                height: 180,
-                decoration: BoxDecoration(
-                  color: Colors.grey.shade200,
-                  borderRadius: const BorderRadius.vertical(top: Radius.circular(16)),
-                ),
-              ),
-              Padding(
-                padding: const EdgeInsets.all(12),
-                child: Column(
-                  children: [
-                    Container(height: 18, width: 120, color: Colors.grey.shade200),
-                    const SizedBox(height: 10),
-                    Container(height: 14, width: double.infinity, color: Colors.grey.shade200),
-                    const SizedBox(height: 6),
-                    Row(
-                      children: [
-                        Expanded(child: Container(height: 28, color: Colors.grey.shade200)),
-                        const SizedBox(width: 8),
-                        Expanded(child: Container(height: 28, color: Colors.grey.shade200)),
-                        const SizedBox(width: 8),
-                        Expanded(child: Container(height: 28, color: Colors.grey.shade200)),
-                      ],
-                    ),
-                  ],
-                ),
-              ),
-            ],
-          ),
-        );
-      },
+class _SmartImage extends StatefulWidget {
+  const _SmartImage({
+    required this.urls,
+    this.fit = BoxFit.cover,
+    this.height,
+    this.width,
+  });
+
+  final List<String> urls;
+  final BoxFit fit;
+  final double? height, width;
+
+  @override
+  State<_SmartImage> createState() => _SmartImageState();
+}
+
+class _SmartImageState extends State<_SmartImage> {
+  int _idx = 0;
+
+  @override
+  Widget build(BuildContext context) {
+    if (widget.urls.isEmpty) {
+      return Container(
+        color: Colors.grey.shade200,
+        alignment: Alignment.center,
+        child: const Icon(Icons.image_not_supported),
+      );
+    }
+    final url = widget.urls[_idx];
+    if (url == null || url.isEmpty) {
+      return Container(
+        color: Colors.grey.shade200,
+        alignment: Alignment.center,
+        child: const Icon(Icons.image_not_supported),
+      );
+    }
+    // ...existing code...
+    return Container(
+      color: Colors.grey.shade200,
+      alignment: Alignment.center,
+      child: const Icon(Icons.image_not_supported),
     );
-  }
-
-  String _short(num n) {
-    if (n >= 1000000) return '${(n / 1000000).toStringAsFixed(1)}M';
-    if (n >= 1000) return '${(n / 1000).toStringAsFixed(0)}K';
-    return n.toStringAsFixed(0);
   }
 }
 
-// ---------- Listing Card (image-first) ----------
+// SAFE hi-res candidates: keep original + upgraded variants (no "$1")
+List<String> _hiResCandidates(String url) {
+  String norm(String u) {
+    var s = u.trim();
+    if (s.startsWith('//')) s = 'https:$s';
+    if (s.startsWith('http://')) s = s.replaceFirst('http://', 'https://');
+    return s;
+  }
+
+  final original = norm(url);
+  String hi = original;
+
+  // RDC: ...-m12345s.jpg -> ... .jpg
+  hi = hi.replaceAll(RegExp(r'-m\d+s(\.(jpg|jpeg|png))$', caseSensitive: false), r'$1');
+
+  // Remove path segments like /300x200 or /1200x900 (at end or before another /)
+  final noPathSize = hi.replaceAll(RegExp(r'/\d{2,4}x\d{2,4}(?=(/|$))'), '');
+
+  // Query sizes -> bump and add dpr
+  String bump(String u) {
+    u = u.replaceAll(RegExp(r'([?&])w=\d+'), r'$1w=1600');
+    u = u.replaceAll(RegExp(r'([?&])width=\d+'), r'$1width=1600');
+    u = u.replaceAll(RegExp(r'([?&])h=\d+'), r'$1h=1200');
+    u = u.replaceAll(RegExp(r'([?&])height=\d+'), r'$1height=1200');
+    u = u.replaceAll(RegExp(r'([?&])size=(small|medium)'), r'$1size=large');
+    if (!u.contains('dpr=')) u += (u.contains('?') ? '&' : '?') + 'dpr=2';
+    return u;
+  }
+
+  final bumped = bump(noPathSize);
+
+  // Strip size-ish query params entirely
+  String stripQuerySizes(String u) {
+    final uri = Uri.parse(u);
+    final qp = Map.of(uri.queryParameters)
+      ..removeWhere((k, _) => {
+        'w','width','h','height','fit','resize','size','auto','quality','q','crop','cs','fm','fl','dpr'
+      }.contains(k.toLowerCase()));
+    return uri.replace(queryParameters: qp.isEmpty ? null : qp).toString();
+  }
+
+  final strippedQuery = stripQuerySizes(noPathSize);
+
+  final set = <String>{};
+  void add(String s) { if (s.isNotEmpty) set.add(s); }
+  add(bumped);
+  add(strippedQuery);
+  add(original);
+  return set.toList();
+}
+
+/* ===========================
+   LISTING CARD + FILTER BAR + MINI PREVIEW
+   =========================== */
+
 class _ListingCard extends StatelessWidget {
   const _ListingCard({
     required this.data,
     required this.saved,
+    required this.likes,
     required this.onTap,
     required this.onSaveToggle,
     required this.onHide,
@@ -977,11 +781,38 @@ class _ListingCard extends StatelessWidget {
 
   final Map<String, dynamic> data;
   final bool saved;
+  final int likes;
   final VoidCallback onTap;
   final VoidCallback onSaveToggle;
   final VoidCallback onHide;
   final VoidCallback onShare;
   final VoidCallback onOpenMaps;
+
+  static String? _prettyType(dynamic v) {
+    final s = (v ?? '').toString().trim().replaceAll('_', ' ');
+    if (s.isEmpty) return null;
+    return s
+        .split(' ')
+        .map((w) => w.isEmpty ? w : (w[0].toUpperCase() + w.substring(1).toLowerCase()))
+        .join(' ');
+  }
+
+  static String _composeAddress(Map<String, dynamic> l) {
+    final a = l['address'];
+    String? line, city, state;
+    if (a is Map) {
+      line  = a['line'] ?? a['street'];
+      city  = a['city'];
+      state = a['state'] ?? a['stateCode'];
+    }
+    line ??= l['addressLine1'] ?? l['streetAddress'] ?? l['formattedAddress'];
+    state ??= l['state'] ?? l['stateCode'];
+    final fallback = (l['formattedAddress'] ?? '').toString();
+    if ((line ?? '').toString().trim().isEmpty) {
+      return fallback.isNotEmpty ? fallback : '${city ?? ''}, ${state ?? ''}';
+    }
+    return '$line, ${city ?? ''}, ${state ?? ''}'.replaceAll(RegExp(r',\s*,+'), ', ');
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -990,22 +821,21 @@ class _ListingCard extends StatelessWidget {
     final baths = _bathsValue(data);
     final sqft  = _num(data['sqft']);
     final type  = _prettyType(data['type'] ?? data['propertyType']);
+    final addr  = _composeAddress(data);
 
-    final addr = _composeAddress(data);
+    final status = _statusPretty(data);
+    final domRaw = data['dom'] ?? data['daysOnMarket'] ?? data['days_on_market'];
+    final dom = (domRaw is num) ? domRaw.toInt() : int.tryParse('${domRaw ?? ''}');
 
-    final photos = _extractPhotoUrls(data);
+  final photos = _extractPhotoUrls(data).expand(_hiResCandidates).toList();
     final heroTag = 'photo-${data['id'] ?? addr}';
 
     final flags = data['flags'] is Map ? (data['flags'] as Map) : const {};
     final isNew = flags['is_new_listing'] == true;
-    final isContingent = flags['is_contingent'] == true;
-    final hasOpenHouse = (data['open_houses'] is List && (data['open_houses'] as List).isNotEmpty);
-
-    final priceReduced = (data['price_reduced_amount'] != null) ||
-        (data['price_reduced_date'] != null);
+    final priceReduced = (data['price_reduced_amount'] != null) || (data['price_reduced_date'] != null);
 
     return Dismissible(
-      key: ValueKey('listing-${data['id'] ?? addr}'),
+      key: ValueKey('listing-' + (data['id'] != null ? data['id'].toString() : addr)),
       background: _swipeBg(context, Icons.favorite, 'Save'),
       secondaryBackground: _swipeBg(context, Icons.hide_source, 'Hide', alignEnd: true),
       confirmDismiss: (dir) async {
@@ -1017,154 +847,41 @@ class _ListingCard extends StatelessWidget {
           return true;
         }
       },
-      child: GestureDetector(
-        onTap: onTap,
-        onLongPress: () => _showActionsSheet(context),
-        child: Card(
-          elevation: 2,
-          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-          clipBehavior: Clip.antiAlias,
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              // ---- Image/Gallery ----
-              Stack(
-                children: [
-                  SizedBox(
-                    height: 180,
-                    width: double.infinity,
-                    child: (photos.isEmpty)
-                        ? Container(color: Colors.grey.shade200, alignment: Alignment.center,
-                            child: const Icon(Icons.home_outlined, size: 36))
-                        : Hero(
-                            tag: heroTag,
-                            child: PageView.builder(
-                              itemCount: min(photos.length, 4),
-                              itemBuilder: (_, i) {
-                                final url = photos[i];
-                                return Image.network(
-                                  url,
-                                  fit: BoxFit.cover,
-                                  errorBuilder: (_, __, ___) => Container(
-                                    color: Colors.grey.shade200,
-                                    alignment: Alignment.center,
-                                    child: const Icon(Icons.image_not_supported),
-                                  ),
-                                );
-                              },
-                            ),
-                          ),
-                  ),
-                  // Price pill
-                  Positioned(
-                    left: 12,
-                    top: 12,
-                    child: Container(
-                      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-                      decoration: BoxDecoration(
-                        color: Theme.of(context).colorScheme.primaryContainer,
-                        borderRadius: BorderRadius.circular(999),
-                        border: Border.all(color: Theme.of(context).colorScheme.outlineVariant),
-                      ),
-                      child: Text(
-                        '\$${_fmt(price)}',
-                        style: TextStyle(
-                          color: Theme.of(context).colorScheme.onPrimaryContainer,
-                          fontWeight: FontWeight.w800,
-                        ),
-                      ),
-                    ),
-                  ),
-                  // Badges
-                  Positioned(
-                    right: 12, top: 12,
-                    child: Row(
-                      children: [
-                        if (isNew) _badge(context, 'New'),
-                        if (priceReduced) const SizedBox(width: 6),
-                        if (priceReduced) _badge(context, 'Price drop'),
-                        if (hasOpenHouse) const SizedBox(width: 6),
-                        if (hasOpenHouse) _badge(context, 'Open house'),
-                        if (isContingent) const SizedBox(width: 6),
-                        if (isContingent) _badge(context, 'Under contract'),
-                      ],
-                    ),
-                  ),
-                  // Quick save
-                  Positioned(
-                    right: 12, bottom: 12,
-                    child: InkWell(
-                      onTap: onSaveToggle,
-                      child: CircleAvatar(
-                        radius: 18,
-                        backgroundColor: Colors.white,
-                        child: Icon(
-                          saved ? Icons.favorite : Icons.favorite_border,
-                          color: saved ? Colors.red : Colors.black87,
-                        ),
-                      ),
-                    ),
-                  ),
-                ],
-              ),
-
-              // ---- Text/details ----
-              Padding(
-                padding: const EdgeInsets.fromLTRB(12, 12, 12, 12),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    // Address (clickable)
-                    InkWell(
-                      onTap: onOpenMaps,
-                      child: Text(
-                        addr,
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w700),
-                      ),
-                    ),
-                    const SizedBox(height: 8),
-                    Wrap(
-                      spacing: 8,
-                      runSpacing: 8,
-                      children: [
-                        _miniChip(context, Icons.bed_outlined, '${_fmtBeds(beds)} bd'),
-                        _miniChip(context, Icons.bathtub_outlined, '${_fmtBaths(baths)} ba'),
-                        if (sqft != null) _miniChip(context, Icons.square_foot, '${_fmt(sqft)} sqft'),
-                        if (type != null) _miniChip(context, Icons.home_work_outlined, type),
-                      ],
-                    ),
-                    const SizedBox(height: 8),
-                    // Quick actions
-                    Row(
-                      children: [
-                        IconButton(
-                          tooltip: saved ? 'Unsave' : 'Save',
-                          icon: Icon(saved ? Icons.favorite : Icons.favorite_border),
-                          onPressed: onSaveToggle,
-                        ),
-                        IconButton(
-                          tooltip: 'Share',
-                          icon: const Icon(Icons.ios_share),
-                          onPressed: onShare,
-                        ),
-                        const Spacer(),
-                        IconButton(
-                          tooltip: 'More',
-                          icon: const Icon(Icons.more_horiz),
-                          onPressed: () => _showActionsSheet(context),
-                        ),
-                      ],
-                    ),
-                  ],
-                ),
-              ),
-            ],
-          ),
+      child: Card(
+        elevation: 2,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+        clipBehavior: Clip.antiAlias,
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            ListTile(
+              title: Text(addr ?? ''),
+              subtitle: Text(type ?? ''),
+              trailing: Text(_fmt(price).toString()),
+              onTap: onTap,
+            ),
+          ],
         ),
       ),
     );
+  }
+
+  // ---- status helpers ----
+  static String? _statusPretty(Map<String, dynamic> l) {
+    final raw = (l['status'] ??
+            l['prop_status'] ??
+            l['status_type'] ??
+            (l['flags'] is Map && (l['flags']['is_contingent'] == true) ? 'under_contract' : null))
+        ?.toString()
+        .toLowerCase();
+
+    if (raw == null || raw.isEmpty) return null;
+    if (raw.contains('for_sale') || raw == 'active') return 'For sale';
+    if (raw.contains('pending')) return 'Pending';
+    if (raw.contains('under') || raw.contains('contingent')) return 'Under contract';
+    if (raw.contains('coming')) return 'Coming soon';
+    if (raw.contains('sold') || raw.contains('closed')) return 'Sold';
+    return raw[0].toUpperCase() + raw.substring(1);
   }
 
   void _showActionsSheet(BuildContext context) {
@@ -1236,27 +953,52 @@ class _ListingCard extends StatelessWidget {
     );
   }
 
-  static String _composeAddress(Map<String, dynamic> l) {
-    final a = l['address'];
-    String? line, city, state;
-    if (a is Map) {
-      line  = a['line'] ?? a['street'];
-      city  = a['city'];
-      state = a['state'] ?? a['stateCode'];
-    }
-    line ??= l['addressLine1'] ?? l['streetAddress'] ?? l['formattedAddress'];
-    city ??= l['city'];
-    state ??= l['state'] ?? l['stateCode'];
-    final fallback = (l['formattedAddress'] ?? '').toString();
-    if ((line ?? '').toString().trim().isEmpty) return fallback.isNotEmpty ? fallback : '${city ?? ''}, ${state ?? ''}';
-    return '$line, ${city ?? ''}, ${state ?? ''}'.replaceAll(RegExp(r',\s*,+'), ', ');
-  }
+  // ---------- image helpers (kept for Firestore mirroring etc.) ----------
+  static String _maybeHiRes(String url) {
+    var u = url.trim();
+    if (u.isEmpty) return u;
 
-  static String? _prettyType(dynamic v) {
-    final s = (v ?? '').toString().trim();
-    if (s.isEmpty) return null;
-    final words = s.replaceAll('_', ' ').split(' ');
-    return words.map((w) => w.isEmpty ? w : (w[0].toUpperCase() + w.substring(1))).join(' ');
+    // normalize scheme
+    if (u.startsWith('//')) u = 'https:$u';
+    if (u.startsWith('http://')) u = u.replaceFirst('http://', 'https://');
+
+    // RDC patterns like ...-m123s.jpg or ...-m123x456s.png -> strip the -m...s
+    u = u.replaceAllMapped(RegExp(r'-m\d+s\.(jpg|jpeg|png)$', caseSensitive: false), (m) => '.${m[1]}');
+    u = u.replaceAllMapped(RegExp(r'-m\d+x\d+s\.(jpg|jpeg|png)$', caseSensitive: false), (m) => '.${m[1]}');
+
+    // Path sizes like /300x200/ -> /1600x1200/ (preserves trailing slash or end)
+    u = u.replaceAllMapped(RegExp(r'/\d{2,4}x\d{2,4}(/|$)'), (m) => '/1600x1200${m[1]}');
+
+    // Query sizes: bump width to ~1600, remove tiny heights, upgrade size=*
+    final uri = Uri.tryParse(u);
+    if (uri != null) {
+      final qp = Map<String, String>.from(uri.queryParameters);
+      bool changed = false;
+
+      void setWidth(int v) {
+        if (qp.containsKey('w')) { qp['w'] = '$v'; changed = true; }
+        if (qp.containsKey('width')) { qp['width'] = '$v'; changed = true; }
+      }
+
+      void removeHeight() {
+        if (qp.remove('h') != null) changed = true;
+        if (qp.remove('height') != null) changed = true;
+      }
+
+      if (qp.containsKey('size')) {
+        final v = qp['size']!.toLowerCase();
+        if (v == 'small' || v == 'medium') { qp['size'] = 'large'; changed = true; }
+      }
+
+      setWidth(1600);
+      removeHeight();
+
+      if (changed) {
+        u = uri.replace(queryParameters: qp).toString();
+      }
+    }
+
+    return u;
   }
 
   static List<String> _extractPhotoUrls(Map<String, dynamic> l) {
@@ -1267,23 +1009,32 @@ class _ListingCard extends StatelessWidget {
       if (s.isEmpty) return;
       if (s.startsWith('//')) s = 'https:$s';
       if (s.startsWith('http://')) s = s.replaceFirst('http://', 'https://');
-      if (s.startsWith('https://')) urls.add(s);
+      if (s.startsWith('https://')) urls.add(_maybeHiRes(s));
     }
-    add(l['primaryPhotoUrl']); add(l['primaryPhotoURL']); add(l['primaryPhoto']);
-    add(l['imageUrl']); add(l['imageURL']); add(l['photo']); add(l['thumbnail']);
-    add(l['thumbnailUrl']); add(l['thumbnailURL']);
-    final a = l['address'];
-    if (a is Map) { add(a['imageUrl']); add(a['thumbnail']); }
-    for (final key in const ['photos', 'photoUrls', 'photoURLs', 'images', 'media']) {
-      final arr = l[key];
-      if (arr is List) {
-        for (final item in arr) {
-          if (item is String) add(item);
-          if (item is Map) { add(item['url']); add(item['href']); add(item['link']); add(item['imageUrl']); add(item['thumbnailUrl']); add(item['mediaUrl']); }
+
+    // Handle various listing photo field formats
+    if (l['photos'] is List) {
+      for (var p in l['photos']) {
+        if (p is String) {
+          add(p);
+        } else if (p is Map && p['url'] is String) {
+          add(p['url']);
         }
       }
     }
-    return urls.toSet().toList();
+    if (l['photo'] is String) add(l['photo']);
+    if (l['primary_photo'] is Map && l['primary_photo']['href'] is String) {
+      add(l['primary_photo']['href']);
+    }
+    if (l['thumbnail'] is String) add(l['thumbnail']);
+    if (l['images'] is List) {
+      for (var img in l['images']) {
+        if (img is String) add(img);
+        if (img is Map && img['url'] is String) add(img['url']);
+      }
+    }
+
+    return urls.toSet().toList(); // ensure unique URLs
   }
 
   static num? _bedsValue(Map<String, dynamic> l) {
@@ -1330,7 +1081,6 @@ class _ListingCard extends StatelessWidget {
   }
 }
 
-// ---------- Pretty top filter summary ----------
 class _FiltersBar extends StatelessWidget {
   const _FiltersBar({
     required this.city,
@@ -1406,19 +1156,21 @@ class _FiltersBar extends StatelessWidget {
         scrollDirection: Axis.horizontal,
         child: Row(
           children: chips
-              .map((c) => Container(
-                    margin: const EdgeInsets.only(right: 8),
-                    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
-                    decoration: BoxDecoration(
-                      color: Colors.white,
-                      border: Border.all(color: Colors.black12),
-                      borderRadius: BorderRadius.circular(999),
-                    ),
-                    child: Text(
-                      c,
-                      style: const TextStyle(fontSize: 12.5, fontWeight: FontWeight.w600),
-                    ),
-                  ))
+              .map(
+                (c) => Container(
+                  margin: const EdgeInsets.only(right: 8),
+                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
+                  decoration: BoxDecoration(
+                    color: Colors.white,
+                    border: Border.all(color: Colors.black12),
+                    borderRadius: BorderRadius.circular(999),
+                  ),
+                  child: Text(
+                    c,
+                    style: const TextStyle(fontSize: 12.5, fontWeight: FontWeight.w600),
+                  ),
+                ),
+              )
               .toList(),
         ),
       ),
@@ -1438,32 +1190,14 @@ class _FiltersBar extends StatelessWidget {
 
   static String _titleCase(String s) =>
       s.split(' ').map((w) => w.isEmpty ? w : (w[0].toUpperCase() + w.substring(1))).join(' ');
+// End of _FiltersBar
+
+
 }
 
-// ---------- small UI helpers ----------
-class _ZoomBtn extends StatelessWidget {
-  final IconData icon;
-  final VoidCallback onTap;
-  const _ZoomBtn({required this.icon, required this.onTap});
-
-  @override
-  Widget build(BuildContext context) {
-    return Material(
-      color: Colors.white,
-      shape: const CircleBorder(),
-      elevation: 3,
-      child: InkWell(
-        customBorder: const CircleBorder(),
-        onTap: onTap,
-        child: SizedBox(
-          width: 44,
-          height: 44,
-          child: Icon(icon, size: 22),
-        ),
-      ),
-    );
-  }
-}
+/* ===========================
+   SMALL UI HELPER: MINI PREVIEW CARD
+   =========================== */
 
 class _MiniPreviewCard extends StatelessWidget {
   const _MiniPreviewCard({required this.data, required this.onOpen});
@@ -1472,10 +1206,11 @@ class _MiniPreviewCard extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final photos = _ListingCard._extractPhotoUrls(data);
+    final photos = _ListingCard._extractPhotoUrls(data).map(_ListingCard._maybeHiRes).toList();
     final url = photos.isEmpty ? null : photos.first;
     final price = _ListingCard._fmt(_ListingCard._num(data['price'])?.toInt() ?? 0);
     final addr = _ListingCard._composeAddress(data);
+
     return Material(
       borderRadius: BorderRadius.circular(16),
       color: Colors.white,
@@ -1487,13 +1222,23 @@ class _MiniPreviewCard extends StatelessWidget {
           children: [
             ClipRRect(
               borderRadius: const BorderRadius.only(
-                topLeft: Radius.circular(16), bottomLeft: Radius.circular(16),
+                topLeft: Radius.circular(16),
+                bottomLeft: Radius.circular(16),
               ),
               child: SizedBox(
-                width: 88, height: 72,
+                width: 88,
+                height: 72,
                 child: url == null
-                    ? Container(color: Colors.grey.shade200, alignment: Alignment.center, child: const Icon(Icons.home_outlined))
-                    : Image.network(url, fit: BoxFit.cover),
+                    ? Container(
+                        color: Colors.grey.shade200,
+                        alignment: Alignment.center,
+                        child: const Icon(Icons.home_outlined),
+                      )
+                    : Container(
+                        color: Colors.grey.shade200,
+                        alignment: Alignment.center,
+                        child: const Icon(Icons.image_not_supported),
+                      ),
               ),
             ),
             const SizedBox(width: 10),

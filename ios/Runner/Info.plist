@@ -45,8 +45,22 @@
 		<string>UIInterfaceOrientationLandscapeLeft</string>
 		<string>UIInterfaceOrientationLandscapeRight</string>
 	</array>
+	<key>NSLocationAlwaysAndWhenInUseUsageDescription</key>
+	<string>Hommie uses your location to show nearby homes and estimate distances to saved places.</string>
 	<key>NSLocationWhenInUseUsageDescription</key>
-	<string>We need your location to find listings near you.</string>
+	<string>Hommie uses your location to show nearby homes and estimate distances to saved places.</string>
+	<key>NSPhotoLibraryUsageDescription</key>
+<string>Hommie lets you attach photos you took during visits.</string>
+<key>NSPhotoLibraryAddUsageDescription</key>
+<string>Hommie saves the photos you upload to your library if you choose.</string>
+<key>NSCameraUsageDescription</key>
+<string>Hommie uses the camera if you choose to take a photo during a visit.</string>
+
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsArbitraryLoads</key>
+		<true/>
+	</dict>
 
 </dict>
 </plist>
