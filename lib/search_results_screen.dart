@@ -21,7 +21,9 @@ class SearchResultsScreen extends StatefulWidget {
 
 enum _SortMode { newest, priceLow, priceHigh, beds, sqft, dom }
 
-class _SearchResultsScreenState extends State<SearchResultsScreen> {
+class _SearchResultsScreenState extends State<SearchResultsScreen> 
+
+  // The full implementation is below (see the rest of your file).
   // ---- API ----
   late final RealtorApiService _realtor = RealtorApiService();
 
@@ -34,7 +36,7 @@ class _SearchResultsScreenState extends State<SearchResultsScreen> {
   // Data
   List<Map<String, dynamic>> _listings = [];
   int _offset = 0;
-  static const int _pageSize = 50;
+  final int _pageSize = 50;
 
   // Query (from args)
   String? _city;
