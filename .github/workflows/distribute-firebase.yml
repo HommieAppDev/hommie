@@ -1,0 +1,83 @@
+name: Distribute to Firebase
+
+on:
+  push:
+    branches: [ main ]   # change to your default branch if it's not 'main'
+
+jobs:
+  android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.22.0'
+          channel: 'stable'
+          cache: true
+
+      - name: Flutter pub get
+        run: flutter pub get
+
+      - name: Decode keystore for signing
+        run: |
+          echo "${ANDROID_KEYSTORE_BASE64}" | base64 -d > android/release.keystore
+          cat > android/key.properties <<EOF
+          storeFile=release.keystore
+          storePassword=${ANDROID_KEYSTORE_PASSWORD}
+          keyAlias=${ANDROID_KEY_ALIAS}
+          keyPassword=${ANDROID_KEY_PASSWORD}
+          EOF
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+
+      - name: Build Android AAB
+        run: flutter build appbundle --release
+
+      - name: Upload to Firebase App Distribution (Android)
+        run: |
+          curl -sL https://firebase.tools | bash
+          firebase appdistribution:distribute build/app/outputs/bundle/release/app-release.aab \
+            --app "${ANDROID_FIREBASE_APP_ID}" \
+            --groups "internal-testers" \
+            --release-notes "CI upload from $(git rev-parse --short HEAD)"
+        env:
+          FIREBASE_TOKEN: ${{ secrets.FIREBASE_TOKEN }}
+          ANDROID_FIREBASE_APP_ID: ${{ secrets.ANDROID_FIREBASE_APP_ID }}
+
+  ios:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.22.0'
+          channel: 'stable'
+          cache: true
+
+      - name: Flutter pub get
+        run: flutter pub get
+
+      - name: Install CocoaPods deps
+        run: |
+          cd ios
+          pod install --repo-update
+
+      - name: Build iOS IPA (no codesign)
+        run: flutter build ipa --release --no-codesign
+
+      - name: Upload to Firebase App Distribution (iOS)
+        run: |
+          curl -sL https://firebase.tools | bash
+          firebase appdistribution:distribute build/ios/ipa/*.ipa \
+            --app "${IOS_FIREBASE_APP_ID}" \
+            --groups "internal-testers" \
+            --release-notes "CI upload from $(git rev-parse --short HEAD)"
+        env:
+          FIREBASE_TOKEN: ${{ secrets.FIREBASE_TOKEN }}
+          IOS_FIREBASE_APP_ID: ${{ secrets.IOS_FIREBASE_APP_ID }}
+
