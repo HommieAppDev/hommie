@@ -21,34 +21,34 @@ jobs:
         run: flutter pub get
 
       - name: Decode keystore for signing
-        run: |
-          echo "${ANDROID_KEYSTORE_BASE64}" | base64 -d > android/app/release.keystore
-          cat > android/key.properties <<EOF
-          storeFile=release.keystore
-          storePassword=${ANDROID_KEYSTORE_PASSWORD}
-          keyAlias=${ANDROID_KEY_ALIAS}
-          keyPassword=${ANDROID_KEY_PASSWORD}
-          EOF
         env:
           ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
           ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
           ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
-              ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
-  
-        - name: Create .env for CI
-          run: |
-            printf "%s\n" "ENV=ci" > .env
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          echo "$ANDROID_KEYSTORE_BASE64" | base64 -d > android/app/release.keystore
+          cat > android/key.properties <<EOF
+          storeFile=release.keystore
+          storePassword=$ANDROID_KEYSTORE_PASSWORD
+          keyAlias=$ANDROID_KEY_ALIAS
+          keyPassword=$ANDROID_KEY_PASSWORD
+          EOF
+
+      - name: Create .env for CI
+        run: |
+          printf "%s\n" "ENV=ci" > .env
 
       - name: Build Android AAB
         run: flutter build appbundle --release
 
       - name: Upload to Firebase App Distribution (Android)
-        run: |
-          curl -sL https://firebase.tools | bash
-          firebase appdistribution:distribute build/app/outputs/bundle/release/app-release.aab \
-            --app "${ANDROID_FIREBASE_APP_ID}" \
-            --groups "internal-testers" \
-            --release-notes "CI upload from $(git rev-parse --short HEAD)"
         env:
           FIREBASE_TOKEN: ${{ secrets.FIREBASE_TOKEN }}
           ANDROID_FIREBASE_APP_ID: ${{ secrets.ANDROID_FIREBASE_APP_ID }}
+        run: |
+          curl -sL https://firebase.tools | bash
+          firebase appdistribution:distribute build/app/outputs/bundle/release/app-release.aab \
+            --app "$ANDROID_FIREBASE_APP_ID" \
+            --groups "internal-testers" \
+            --release-notes "CI upload from $(git rev-parse --short HEAD)"
