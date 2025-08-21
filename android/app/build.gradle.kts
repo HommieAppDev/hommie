@@ -1,5 +1,4 @@
 // android/app/build.gradle.kts
-
 import java.util.Properties
 
 plugins {
@@ -16,20 +15,19 @@ val localProperties = Properties().apply {
 val flutterVersionCode = (localProperties.getProperty("flutter.versionCode") ?: "1").toInt()
 val flutterVersionName = localProperties.getProperty("flutter.versionName") ?: "1.0"
 
+// NOTE: our CI writes key.properties to android/key.properties
 val keystoreProperties = Properties().apply {
-    val f = rootProject.file("key.properties")
+    val f = rootProject.file("android/key.properties")
     if (f.exists()) load(f.inputStream())
 }
 
 android {
-    namespace = "com.krysta.hommie" // <- ensure this matches your package
+    namespace = "com.krysta.hommie"     // make sure this matches your package
     compileSdk = 34
-
-    // Fix CI error: Firebase/plugins require NDK 27
-    ndkVersion = "27.0.12077973"
+    ndkVersion = "27.0.12077973"        // fixes NDK mismatch on CI
 
     defaultConfig {
-        applicationId = "com.krysta.hommie" // <- keep in sync with namespace
+        applicationId = "com.krysta.hommie"
         minSdk = 23
         targetSdk = 34
         versionCode = flutterVersionCode
@@ -39,7 +37,8 @@ android {
 
     signingConfigs {
         create("release") {
-            if (keystoreProperties.isNotEmpty) {
+            // Use a robust condition that works even if some props are missing
+            if (keystoreProperties.containsKey("storeFile")) {
                 storeFile = file(keystoreProperties["storeFile"].toString())
                 storePassword = keystoreProperties["storePassword"].toString()
                 keyAlias = keystoreProperties["keyAlias"].toString()
@@ -50,10 +49,9 @@ android {
 
     buildTypes {
         getByName("debug") {
-            // debug settings as needed
+            // debug options if needed
         }
         getByName("release") {
-            // you can switch these off if not ready to shrink yet
             isMinifyEnabled = true
             isShrinkResources = true
             signingConfig = signingConfigs.getByName("release")
