@@ -50,14 +50,15 @@ jobs:
           ANDROID_FIREBASE_APP_ID: ${{ secrets.ANDROID_FIREBASE_APP_ID }}
 
   ios:
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
+      - uses: maxim-lobanov/setup-xcode@v1
 
       # Pin Xcode so the iOS SDK is present on the runner
       - uses: maxim-lobanov/setup-xcode@v1
         with:
-          xcode-version: "15.4"
+          xcode-version: "16.0"
 
       - uses: subosito/flutter-action@v2
         with:
