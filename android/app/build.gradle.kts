@@ -23,13 +23,13 @@ val keystoreProperties = Properties().apply {
 
 android {
     namespace = "com.krysta.hommie"     // make sure this matches your package
-    compileSdk = 34
+    compileSdk = 35
     ndkVersion = "27.0.12077973"        // fixes NDK mismatch on CI
 
     defaultConfig {
         applicationId = "com.krysta.hommie"
         minSdk = 23
-        targetSdk = 34
+        targetSdk = 35
         versionCode = flutterVersionCode
         versionName = flutterVersionName
         multiDexEnabled = true
