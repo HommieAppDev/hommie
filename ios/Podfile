@@ -1,7 +1,5 @@
 # Podfile
 
-$FirebaseSDKVersion = '10.29.0'
-
 platform :ios, '15.3'
 
 # CocoaPods analytics sends network stats synchronously affecting flutter build latency.
