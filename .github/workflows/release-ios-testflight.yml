@@ -1,0 +1,53 @@
+name: iOS Release to TestFlight
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+jobs:
+  ios-testflight:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: '16'
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: "3.27.0"
+          channel: "stable"
+          cache: true
+      - name: Flutter pub get
+        run: flutter pub get
+      - name: CocoaPods
+        run: |
+          cd ios
+          pod install --repo-update
+      - name: Build IPA (App Store export)
+        run: flutter build ipa --release
+      - name: Upload to TestFlight (fastlane, ASC API key)
+        env:
+          APP_STORE_CONNECT_API_KEY_BASE64: ${{ secrets.APP_STORE_CONNECT_API_KEY_BASE64 }}
+          APP_STORE_CONNECT_API_KEY_ID: ${{ secrets.APP_STORE_CONNECT_API_KEY_ID }}
+          APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+        run: |
+          echo "${APP_STORE_CONNECT_API_KEY_BASE64}" | base64 -d > /tmp/AuthKey.p8
+          gem install fastlane --no-document
+          cd ios
+          cat > Fastfile <<'RUBY'
+          default_platform(:ios)
+          platform :ios do
+            lane :beta do |options|
+              api_key = app_store_connect_api_key(
+                key_id: options[:api_key_id],
+                issuer_id: options[:issuer_id],
+                key_filepath: options[:key_path]
+              )
+              upload_to_testflight(
+                api_key: api_key,
+                skip_waiting_for_build_processing: true
+              )
+            end
+          end
+          RUBY
+          fastlane ios beta api_key_id:$APP_STORE_CONNECT_API_KEY_ID issuer_id:$APP_STORE_CONNECT_ISSUER_ID key_path:/tmp/AuthKey.p8
