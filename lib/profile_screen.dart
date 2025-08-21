@@ -76,7 +76,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
                       GestureDetector(
                         onTap: () async {
                           final result =
-                              await Navigator.pushNamed(context, '/avatar-picker');
+                                await Navigator.pushNamed(context, '/avatar-picker');
                           // No need to handle result here; AvatarPicker writes to Firestore
                           // StreamBuilder will auto-refresh. (Optional: setState if you cache anything.)
                         },

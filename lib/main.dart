@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/painting.dart';
 import 'package:firebase_core/firebase_core.dart';
 import 'package:flutter_dotenv/flutter_dotenv.dart';
 
@@ -22,6 +23,7 @@ import 'compare_listings_screen.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  _tuneImageCache();
 
   // Load .env (for RAPIDAPI_HOST / RAPIDAPI_KEY, etc.)
   await dotenv.load(fileName: ".env");
@@ -32,6 +34,12 @@ Future<void> main() async {
   );
 
   runApp(const HommieApp());
+}
+
+void _tuneImageCache() {
+  final c = PaintingBinding.instance.imageCache;
+  c.maximumSize = 1000;                 // number of images
+  c.maximumSizeBytes = 200 << 20;       // ~200 MB
 }
 
 class HommieApp extends StatelessWidget {
