@@ -70,3 +70,7 @@ windows/flutter/ephemeral/
 # secrets
 *.jks
 *.keystore
+
+# secrets
+*.jks
+*.keystore
