@@ -1,0 +1,158 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function isSelf(uid) {
+      return signedIn() && request.auth.uid == uid;
+    }
+
+    // For existing threads only: check that the user is a participant
+    function isParticipant(threadId) {
+      return signedIn()
+        && exists(/databases/$(database)/documents/threads/$(threadId))
+        && get(/databases/$(database)/documents/threads/$(threadId))
+             .data.participants.hasAll([request.auth.uid]);
+    }
+
+    /* ----------------------------
+       USERS
+    -----------------------------*/
+    match /users/{uid} {
+      allow read:  if signedIn();
+      allow write: if isSelf(uid);
+    }
+
+    /* ----------------------------
+       LISTINGS (public to signed-in)
+       Block client writes on the root doc.
+       Use subcollections for user content.
+    -----------------------------*/
+    match /listings/{listingId} {
+      allow read: if signedIn();
+      allow create, update, delete: if false;
+
+      // ---- Comments on a listing
+      match /comments/{commentId} {
+        allow read: if signedIn();
+
+        allow create: if signedIn()
+          && request.resource.data.keys()
+               .hasOnly(['uid','displayName','text','createdAt'])
+          && request.resource.data.uid == request.auth.uid
+          && request.resource.data.text is string
+          && request.resource.data.text.size() > 0
+          && request.resource.data.text.size() <= 2000
+          && request.resource.data.createdAt is timestamp;
+
+        // Optional: user can delete their own comment
+        allow delete: if signedIn() && resource.data.uid == request.auth.uid;
+
+        // No edits (keeps moderation simple)
+        allow update: if false;
+      }
+
+      // ---- Visitor feedback (post-visit notes)
+      match /visitor_feedback/{feedbackId} {
+        allow read: if signedIn();
+
+        allow create: if signedIn()
+          && request.resource.data.keys()
+               .hasOnly(['uid','text','createdAt','rating'])
+          && request.resource.data.uid == request.auth.uid
+          && (request.resource.data.rating == null
+              || (request.resource.data.rating is number
+                  && request.resource.data.rating >= 1
+                  && request.resource.data.rating <= 5))
+          && request.resource.data.text is string
+          && request.resource.data.text.size() <= 5000
+          && request.resource.data.createdAt is timestamp;
+
+        allow delete: if signedIn() && resource.data.uid == request.auth.uid;
+        allow update: if false;
+      }
+
+      // ---- Uploaded visit photos metadata (approval gate)
+      match /photos/{photoId} {
+        // Anyone signed-in can read approved photos; the uploader can see their own pending items.
+        allow read: if signedIn() && (
+            resource.data.status == 'approved' ||
+            resource.data.uid == request.auth.uid
+        );
+
+        // Clients may only CREATE their own pending record.
+        allow create: if signedIn()
+          && request.resource.data.keys()
+               .hasOnly(['uid','path','status','createdAt'])
+          && request.resource.data.uid == request.auth.uid
+          && request.resource.data.path is string
+          && request.resource.data.status == 'pending'
+          && request.resource.data.createdAt is timestamp;
+
+        // No client updates/deletes; do moderation server-side.
+        allow update, delete: if false;
+      }
+    }
+
+    /* ----------------------------
+       FAVORITES & VISITED (per user)
+       Paths: /favorites/{uid}/listings/{listingId}
+              /visited/{uid}/listings/{listingId}
+    -----------------------------*/
+    match /favorites/{uid}/listings/{listingId} {
+      allow read, write: if isSelf(uid);
+    }
+    match /visited/{uid}/listings/{listingId} {
+      allow read, write: if isSelf(uid);
+    }
+
+    /* ----------------------------
+       DIRECT MESSAGES
+       threads/{threadId}
+         - participants: [uid...]
+         - createdAt, lastMessage (optional)
+       threads/{threadId}/messages/{messageId}
+         - senderUid, text OR image, createdAt
+    -----------------------------*/
+    match /threads/{threadId} {
+      // Create: doc doesn't exist yet—validate payload.
+      allow create: if signedIn()
+        && request.resource.data.keys()
+             .hasOnly(['participants','createdAt','lastMessage'])
+        && request.resource.data.participants is list
+        && request.resource.data.participants.size() >= 2
+        && request.resource.data.participants.size() <= 20
+        && request.resource.data.participants.hasAll([request.auth.uid])
+        && request.resource.data.createdAt is timestamp;
+
+      // Read/Update existing threads only for participants
+      allow read, update: if isParticipant(threadId);
+
+      // Block client deletes (keep history). Do server-side if needed.
+      allow delete: if false;
+
+      match /messages/{messageId} {
+        allow read: if isParticipant(threadId);
+
+        allow create: if isParticipant(threadId)
+          && request.resource.data.keys()
+               .hasOnly(['senderUid','text','image','createdAt'])
+          && request.resource.data.senderUid == request.auth.uid
+          && (
+               (request.resource.data.text is string
+                 && request.resource.data.text.size() > 0
+                 && request.resource.data.text.size() <= 5000)
+               || (request.resource.data.image is string
+                   && request.resource.data.image.size() > 0)
+             )
+          && request.resource.data.createdAt is timestamp;
+
+        // No edits/deletes by clients
+        allow update, delete: if false;
+      }
+    }
+  }
+}

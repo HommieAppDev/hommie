@@ -1,0 +1,23 @@
+rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+
+    // Visit photos uploaded by users:
+    // Path convention: listing_visits/{listingId}/{uid}/{file...}
+    match /listing_visits/{listingId}/{uid}/{file=**} {
+      // Let signed-in users view (tighten to only owner if you prefer)
+      allow read: if request.auth != null;
+
+      // Only the signed-in owner can upload; images only; max 10 MB
+      allow write: if request.auth != null
+                   && request.auth.uid == uid
+                   && request.resource.contentType.matches('image/.*')
+                   && request.resource.size < 10 * 1024 * 1024;
+    }
+
+    // Deny everything else by default
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}

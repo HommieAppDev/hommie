@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/painting.dart';
 import 'package:firebase_core/firebase_core.dart';
 import 'package:flutter_dotenv/flutter_dotenv.dart';
+import 'package:supabase_flutter/supabase_flutter.dart';
 
 import 'firebase_options.dart';
 
@@ -38,8 +39,8 @@ Future<void> main() async {
 
 void _tuneImageCache() {
   final c = PaintingBinding.instance.imageCache;
-  c.maximumSize = 1000;                 // number of images
-  c.maximumSizeBytes = 200 << 20;       // ~200 MB
+  c.maximumSize = 1000; // number of images
+  c.maximumSizeBytes = 200 << 20; // ~200 MB
 }
 
 class HommieApp extends StatelessWidget {
@@ -85,7 +86,8 @@ class HommieApp extends StatelessWidget {
       onGenerateRoute: (settings) {
         if (settings.name == '/listing-details') {
           final args = (settings.arguments as Map?) ?? const {};
-          final listing = (args['listing'] as Map?)?.cast<String, dynamic>() ?? const <String, dynamic>{};
+          final listing = (args['listing'] as Map?)?.cast<String, dynamic>() ??
+              const <String, dynamic>{};
           return MaterialPageRoute(
             builder: (_) => ListingDetailsScreen(listing: listing),
             settings: settings,

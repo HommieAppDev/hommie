@@ -1,0 +1,2 @@
+package_name("com.hommie.app") # replace with your actual applicationId from build.gradle
+

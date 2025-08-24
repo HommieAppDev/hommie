@@ -3,7 +3,7 @@ import java.util.Properties
 
 plugins {
     id("com.android.application")
-    id("org.jetbrains.kotlin.android")
+    id("kotlin-android")                    // keep ONE kotlin plugin
     id("dev.flutter.flutter-gradle-plugin")
     id("com.google.gms.google-services")
 }
@@ -22,14 +22,16 @@ val keystoreProperties = Properties().apply {
 }
 
 android {
-    namespace = "com.krysta.hommie"     // make sure this matches your package
-    compileSdk = 35
-    ndkVersion = "27.0.12077973"        // fixes NDK mismatch on CI
+    namespace = "com.krysta.hommie"
+    compileSdk = 36
+    ndkVersion = "27.0.12077973"
 
     defaultConfig {
         applicationId = "com.krysta.hommie"
-        minSdk = 23
-        targetSdk = 35
+        // KTS syntax (was: minSdkVersion flutter.minSdkVersion)
+        // If you use Firebase, many plugins need at least 23:
+        minSdk = maxOf(23, flutter.minSdkVersion)
+        targetSdk = 36
         versionCode = flutterVersionCode
         versionName = flutterVersionName
         multiDexEnabled = true
@@ -37,7 +39,6 @@ android {
 
     signingConfigs {
         create("release") {
-            // Use a robust condition that works even if some props are missing
             if (keystoreProperties.containsKey("storeFile")) {
                 storeFile = file(keystoreProperties["storeFile"].toString())
                 storePassword = keystoreProperties["storePassword"].toString()
@@ -48,9 +49,7 @@ android {
     }
 
     buildTypes {
-        getByName("debug") {
-            // debug options if needed
-        }
+        getByName("debug") { /* debug options if needed */ }
         getByName("release") {
             isMinifyEnabled = true
             isShrinkResources = true
@@ -66,16 +65,12 @@ android {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
     }
-    kotlinOptions {
-        jvmTarget = "17"
-    }
+    kotlinOptions { jvmTarget = "17" }
 }
 
-flutter {
-    source = "../.."
-}
+flutter { source = "../.." }
 
 dependencies {
-    implementation("org.jetbrains.kotlin:kotlin-stdlib-jdk8")
     implementation("androidx.multidex:multidex:2.0.1")
+    // kotlin stdlib is added automatically by the plugin; no need to add it manually
 }
