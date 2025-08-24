@@ -48,3 +48,21 @@ app.*.map.json
 ios/Pods/
 firebase_options.dart
 .env
+# Flutter build + tooling
+build/
+.dart_tool/
+ios/Pods/
+ios/build/
+android/build/
+android/.gradle/
+macos/Flutter/ephemeral/
+linux/flutter/ephemeral/
+windows/flutter/ephemeral/
+
+# Secrets
+*.jks
+*.keystore
+**/GoogleService-Info.plist
+**/google-services.json
+.env
+*.env
