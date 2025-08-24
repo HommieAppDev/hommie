@@ -66,3 +66,7 @@ windows/flutter/ephemeral/
 **/google-services.json
 .env
 *.env
+
+# secrets
+*.jks
+*.keystore
